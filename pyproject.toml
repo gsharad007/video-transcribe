@@ -9,6 +9,15 @@ dependencies = [
     "faster-whisper>=1.1.0",
 ]
 
+[project.optional-dependencies]
+# Speaker diarization (who-said-what). Heavy: pulls in torch + pyannote.
+# Install with:  uv sync --extra diarize
+diarize = [
+    "pyannote.audio>=3.1",
+    "torch>=2.2",
+    "torchaudio>=2.2",
+]
+
 [project.scripts]
 video-transcribe = "video_transcribe.cli:main"
 
