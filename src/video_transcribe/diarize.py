@@ -112,7 +112,11 @@ def run_pipeline(
         if max_speakers is not None:
             kwargs["max_speakers"] = max_speakers
 
-    annotation = pipeline({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
+    output = pipeline({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
+
+    # pyannote 4.x returns a DiarizeOutput wrapper; older releases (and some
+    # pipelines) return the Annotation directly.
+    annotation = getattr(output, "speaker_diarization", output)
 
     turns = [
         SpeakerTurn(start=float(seg.start), end=float(seg.end), speaker=str(label))

@@ -17,6 +17,12 @@ diarize = [
     "torch>=2.2",
     "torchaudio>=2.2",
 ]
+# Punctuation + capitalisation + sentence segmentation for Whisper's run-on
+# output. Uses onnxruntime (already pulled in by faster-whisper), so it's light.
+# Install with:  uv sync --extra readable   (combine: --extra diarize --extra readable)
+readable = [
+    "punctuators>=0.0.5",
+]
 
 [project.scripts]
 video-transcribe = "video_transcribe.cli:main"

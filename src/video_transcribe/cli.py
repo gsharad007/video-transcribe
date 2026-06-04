@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from video_transcribe import __version__, audio, diarize, formats, merge
+from video_transcribe import __version__, audio, diarize, formats, merge, punctuate
 from video_transcribe.transcribe import Segment, transcribe
 
 EXT = {"txt": ".txt", "srt": ".srt", "vtt": ".vtt", "json": ".json"}
@@ -68,6 +68,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Disable voice-activity-detection filtering.")
     p.add_argument("--no-tidy", action="store_true",
                    help="Skip the light readability pass (capitalisation/spacing).")
+    p.add_argument("--no-punctuate", action="store_true",
+                   help="Skip ML punctuation/sentence restoration (needs 'readable' extra; "
+                        "on by default when installed).")
 
     g = p.add_argument_group("speaker diarization (who-said-what)")
     g.add_argument("--diarize", action="store_true",
@@ -95,7 +98,8 @@ def _log(quiet: bool, msg: str) -> None:
         print(msg, file=sys.stderr)
 
 
-def _transcribe_one(inp: Path, args: argparse.Namespace, fmts: list[str], pipeline) -> int:
+def _transcribe_one(inp: Path, args: argparse.Namespace, fmts: list[str],
+                    pipeline, punctuator) -> int:
     if not inp.exists():
         print(f"error: file not found: {inp}", file=sys.stderr)
         return 1
@@ -143,7 +147,10 @@ def _transcribe_one(inp: Path, args: argparse.Namespace, fmts: list[str], pipeli
             n = len({t.speaker for t in turns})
             _log(args.quiet, f"    found {n} speaker(s) across {len(turns)} turns")
 
-    conv = merge.build_conversation(result.segments, turns, tidy=not args.no_tidy)
+    if punctuator is not None and not args.quiet:
+        print("    restoring punctuation ...", file=sys.stderr)
+    conv = merge.build_conversation(result.segments, turns,
+                                    tidy=not args.no_tidy, punctuator=punctuator)
     meta = formats.Meta.from_result(inp.name, result, diarized=bool(turns))
 
     for fmt in fmts:
@@ -169,9 +176,15 @@ def main(argv: list[str] | None = None) -> int:
                 num_threads=None,
             )
 
+        punctuator = None
+        if not args.no_punctuate and punctuate.available():
+            _log(args.quiet, "loading punctuation model (pcs_en) ...")
+            pmodel = punctuate.load()
+            punctuator = lambda texts: punctuate.restore(pmodel, texts)
+
         rc = 0
         for inp in args.inputs:
-            rc |= _transcribe_one(inp, args, fmts, pipeline)
+            rc |= _transcribe_one(inp, args, fmts, pipeline, punctuator)
         return rc
     except audio.FFmpegNotFound as e:
         print(f"error: {e}", file=sys.stderr)

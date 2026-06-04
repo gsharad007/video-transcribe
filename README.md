@@ -2,9 +2,12 @@
 
 Transcribe speech from video/audio files **locally** — no cloud, no API keys for
 the transcription itself. Audio is extracted with `ffmpeg`, transcribed with
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper), and optionally
-**speaker-labeled** with [pyannote.audio](https://github.com/pyannote/pyannote-audio).
-Output is clean, timestamped, speaker-grouped text (plus SRT/VTT/JSON).
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper), optionally
+**speaker-labeled** with [pyannote.audio](https://github.com/pyannote/pyannote-audio),
+and **re-punctuated** (sentences + capitalization) with
+[punctuators](https://github.com/1-800-BAD-CODE/punctuators) so Whisper's run-on
+output reads cleanly. Result: timestamped, speaker-grouped paragraphs (plus
+SRT/VTT/JSON).
 
 ## Requirements
 
@@ -14,9 +17,14 @@ Output is clean, timestamped, speaker-grouped text (plus SRT/VTT/JSON).
 ## Install
 
 ```pwsh
-uv sync                    # transcription only
-uv sync --extra diarize    # + speaker diarization (pulls in torch + pyannote)
+uv sync                                   # transcription only
+uv sync --extra diarize --extra readable  # + speaker labels + punctuation (full)
 ```
+
+- `diarize` pulls in torch + pyannote (~2–3 GB); needed for `--diarize`.
+- `readable` pulls in `punctuators` (tiny — reuses the onnxruntime faster-whisper
+  already installs); enables sentence/punctuation restoration. On by default when
+  installed; disable per-run with `--no-punctuate`.
 
 ## Usage
 
@@ -57,9 +65,18 @@ Run `uv run video-transcribe --help` for all options.
 | `--device`       | `cpu`            | `cuda` is **NVIDIA-only**                          |
 | `--language`     | autodetect       | force a code like `en`/`ko` to skip detection      |
 | `-f/--format`    | `txt`            | repeatable: `txt`, `srt`, `vtt`, `json`            |
-| `--no-tidy`      | off              | keep raw casing/spacing (skip readability pass)    |
+| `--no-punctuate` | off              | skip ML sentence/punctuation restoration           |
+| `--no-tidy`      | off              | keep raw casing/spacing (skip light readability pass) |
 
 First run downloads the model (large-v3 ≈ 3 GB) to `~/.cache/huggingface`.
+
+### Readability / punctuation
+
+Whisper emits long, lightly-punctuated runs on casual speech. With the `readable`
+extra installed, each transcript is re-punctuated and split into sentences over
+the full per-speaker stream. It's a small truecasing model, so expect occasional
+over-capitalization (e.g. a word after a comma) — the trade for far more readable
+text. Use `--no-punctuate` for verbatim, unpunctuated output.
 
 ## Speaker diarization setup (one time)
 
@@ -100,6 +117,7 @@ src/video_transcribe/
   transcribe.py   # faster-whisper wrapper -> Segment / Word / TranscriptionResult
   diarize.py      # pyannote wrapper -> SpeakerTurn (in-memory WAV, no torchcodec)
   merge.py        # assign speakers, clean hallucinations, regroup -> Conversation
+  punctuate.py    # optional sentence/punctuation restoration (punctuators/ONNX)
   formats.py      # readable txt + srt / vtt / json writers
   cli.py          # argument parsing + orchestration
 tests/
