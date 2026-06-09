@@ -129,6 +129,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Treat the input FILES as parallel tracks of ONE recording, "
                         "labeled by these comma-separated names (e.g. \"Mar,Sharad\" for "
                         "video+separate-mic), merged by timestamp into one transcript.")
+    t.add_argument("--mux", action="store_true",
+                   help="With --track-speakers on a video+mic pair, also write one .mkv "
+                        "with Mix (default) + Desktop + Mic audio tracks.")
 
     p.add_argument("--keep-audio", action="store_true",
                    help="Keep the intermediate 16 kHz WAV alongside the output.")
@@ -337,6 +340,20 @@ def _transcribe_merged_files(inputs: list[Path], names: list[str],
         out_path = out_dir / (inputs[0].stem + EXT[fmt])
         out_path.write_text(formats.WRITERS[fmt](conv, meta), encoding="utf-8")
         _log(args.quiet, f"    wrote {out_path}")
+
+    if args.mux:
+        flags = [audio.has_video(i) for i in inputs]
+        videos = [i for i, v in zip(inputs, flags) if v]
+        mics = [i for i, v in zip(inputs, flags) if not v]
+        if len(videos) == 1 and len(mics) == 1:
+            mkv = out_dir / (videos[0].stem + ".with-mic.mkv")
+            _log(args.quiet, f"    muxing video + mic -> {mkv.name} (copies the video) ...")
+            audio.mux_tracks(videos[0], mics[0], mkv)
+            _log(args.quiet, f"    wrote {mkv}")
+        else:
+            print(f"warning: --mux needs one video + one audio-only (mic) input "
+                  f"(found {len(videos)} video / {len(mics)} audio); skipping mux",
+                  file=sys.stderr)
     return 0
 
 

@@ -97,3 +97,41 @@ def probe_streams(media: Path) -> list[dict]:
             "language": tags.get("language"),
         })
     return out
+
+
+def has_video(media: Path) -> bool:
+    """True if the file contains at least one video stream."""
+    ffprobe = _require("ffprobe")
+    proc = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v",
+         "-show_entries", "stream=index", "-of", "csv=p=0", str(media)],
+        capture_output=True, text=True,
+    )
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def mux_tracks(video: Path, mic: Path, dest: Path, *, mix_bitrate: str = "256k") -> Path:
+    """Combine a video (with its desktop audio) + a separate mic file into one MKV.
+
+    Produces three audio tracks: a default **Mix** (desktop+mic, so both play on
+    hit-play), plus separate **Desktop** and **Mic** tracks. The video stream is
+    stream-copied (no re-encode); only the Mix is (re-)encoded to AAC.
+    """
+    ffmpeg = _require("ffmpeg")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error", "-i", str(video), "-i", str(mic),
+        "-filter_complex",
+        "[0:a:0][1:a:0]amix=inputs=2:duration=longest:normalize=0[mix]",
+        "-map", "0:v:0", "-map", "[mix]", "-map", "0:a:0", "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a:0", "aac", "-b:a:0", mix_bitrate, "-c:a:1", "copy", "-c:a:2", "copy",
+        "-metadata:s:a:0", "title=Mix", "-disposition:a:0", "default",
+        "-metadata:s:a:1", "title=Desktop", "-disposition:a:1", "0",
+        "-metadata:s:a:2", "title=Mic", "-disposition:a:2", "0",
+        str(dest),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to mux {video} + {mic}:\n{proc.stderr.strip()}")
+    return dest

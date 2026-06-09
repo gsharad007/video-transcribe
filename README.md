@@ -85,19 +85,40 @@ text. Use `--no-punctuate` for verbatim, unpunctuated output.
 
 ## Multi-track recordings — the most accurate speaker labels
 
-If your recorder captured each person on a **separate audio track** — e.g. AMD
-ReLive's *Separate Microphone Track* (your mic on one track, the meeting app's
-audio on another) — skip acoustic diarization entirely:
+If each person was captured on a **separate audio source** — e.g. AMD ReLive's
+*Separate Microphone Track* (your mic vs the meeting app's audio) — skip acoustic
+diarization entirely and label by track. Two layouts:
 
+**Two streams in one file** (mic muxed into the video):
 ```pwsh
 uv run video-transcribe meeting.mp4 --list-tracks            # find the indices
 uv run video-transcribe meeting.mp4 --tracks "0=Mar,1=Sharad"
 ```
 
-Each track is transcribed independently, labeled by who's on it, then the streams
-are merged by timestamp. This gives **exact** speaker attribution (no guessing),
-is faster (no pyannote, no word timestamps), and sidesteps alignment artifacts.
-Record with **headphones** so your mic doesn't pick up the other side (bleed).
+**Two separate files** (mic written to its own file, e.g. `.m4a`):
+```pwsh
+uv run video-transcribe meeting.mp4 meeting.m4a --track-speakers "Mar,Sharad"
+```
+
+Each track is transcribed independently and merged by timestamp — **exact** speaker
+attribution (no guessing), faster (no pyannote/word-timestamps), no alignment
+artifacts. Record with **headphones** so your mic doesn't pick up the other side.
+
+### Merge video + separate mic into one playable file
+
+Standard players play only one audio track at a time, so to get a file where
+**both** play on hit-play *and* the mic stays isolated, add a default **Mix** track
+beside the originals (titles are the generic `Mix` / `Desktop` / `Mic`):
+
+```pwsh
+# all-in-one: transcript + a .mkv with Mix(default) + Desktop + Mic tracks
+uv run video-transcribe meeting.mp4 meeting.m4a --track-speakers "Mar,Sharad" --mux
+
+# just merge, no transcript:
+uv run python -m video_transcribe.mux meeting.mp4 meeting.m4a   # -> meeting.with-mic.mkv
+```
+
+The video is stream-copied (no re-encode); only the small Mix track is encoded.
 
 ## Speaker diarization setup (one time)
 
@@ -134,14 +155,15 @@ so it can slot in without touching the CLI, merge, or formatters.
 
 ```
 src/video_transcribe/
-  audio.py        # ffmpeg: probe duration/streams, extract 16 kHz mono WAV (per-track)
+  audio.py        # ffmpeg: probe, extract per-track WAV, mux video+mic
   transcribe.py   # faster-whisper wrapper -> Segment / Word / TranscriptionResult
   diarize.py      # pyannote wrapper -> SpeakerTurn (in-memory WAV, no torchcodec)
   merge.py        # assign speakers (diarization OR per-track), clean, regroup
   punctuate.py    # optional sentence/punctuation restoration (punctuators/ONNX)
   correct.py      # apply a glossary (term fixes + speaker names) to a transcript
+  mux.py          # merge video + separate mic -> one MKV (Mix/Desktop/Mic)
   formats.py      # readable txt + srt / vtt / json writers
-  cli.py          # argument parsing + orchestration (diarize / --tracks modes)
+  cli.py          # argument parsing + orchestration (diarize / tracks / mux)
 tests/
   smoke.py        # model-free merge/format checks
   real_check.py   # faster-whisper word-timestamps -> merge (no HF token)
