@@ -38,6 +38,10 @@ uv run video-transcribe meeting.mp4 --diarize -f txt -f srt
 # Tell pyannote how many speakers if you know (more accurate)
 uv run video-transcribe interview.mp4 --diarize --speakers 2
 
+# Two-track recording (e.g. ReLive separate mic): exact speakers, no diarization
+uv run video-transcribe meeting.mp4 --list-tracks            # see track indices
+uv run video-transcribe meeting.mp4 --tracks "0=Mar,1=Sharad"
+
 # Faster, lower quality; force language; quick test
 uv run video-transcribe clip.mp4 --model large-v3-turbo --language en
 ```
@@ -62,6 +66,7 @@ Run `uv run video-transcribe --help` for all options.
 | `--diarize`      | off              | speaker labels via pyannote (needs HF token)       |
 | `--hf-token`     | `$env:HF_TOKEN`  | Hugging Face token for the gated diarization model |
 | `--speakers`     | auto             | exact count; or `--min/--max-speakers`             |
+| `--tracks`       | off              | `"0=Mar,1=Sharad"` — label by audio track (exact, no diarization) |
 | `--device`       | `cpu`            | `cuda` is **NVIDIA-only**                          |
 | `--language`     | autodetect       | force a code like `en`/`ko` to skip detection      |
 | `-f/--format`    | `txt`            | repeatable: `txt`, `srt`, `vtt`, `json`            |
@@ -77,6 +82,22 @@ extra installed, each transcript is re-punctuated and split into sentences over
 the full per-speaker stream. It's a small truecasing model, so expect occasional
 over-capitalization (e.g. a word after a comma) — the trade for far more readable
 text. Use `--no-punctuate` for verbatim, unpunctuated output.
+
+## Multi-track recordings — the most accurate speaker labels
+
+If your recorder captured each person on a **separate audio track** — e.g. AMD
+ReLive's *Separate Microphone Track* (your mic on one track, the meeting app's
+audio on another) — skip acoustic diarization entirely:
+
+```pwsh
+uv run video-transcribe meeting.mp4 --list-tracks            # find the indices
+uv run video-transcribe meeting.mp4 --tracks "0=Mar,1=Sharad"
+```
+
+Each track is transcribed independently, labeled by who's on it, then the streams
+are merged by timestamp. This gives **exact** speaker attribution (no guessing),
+is faster (no pyannote, no word timestamps), and sidesteps alignment artifacts.
+Record with **headphones** so your mic doesn't pick up the other side (bleed).
 
 ## Speaker diarization setup (one time)
 
@@ -113,13 +134,14 @@ so it can slot in without touching the CLI, merge, or formatters.
 
 ```
 src/video_transcribe/
-  audio.py        # ffmpeg: probe duration, extract 16 kHz mono WAV
+  audio.py        # ffmpeg: probe duration/streams, extract 16 kHz mono WAV (per-track)
   transcribe.py   # faster-whisper wrapper -> Segment / Word / TranscriptionResult
   diarize.py      # pyannote wrapper -> SpeakerTurn (in-memory WAV, no torchcodec)
-  merge.py        # assign speakers, clean hallucinations, regroup -> Conversation
+  merge.py        # assign speakers (diarization OR per-track), clean, regroup
   punctuate.py    # optional sentence/punctuation restoration (punctuators/ONNX)
+  correct.py      # apply a glossary (term fixes + speaker names) to a transcript
   formats.py      # readable txt + srt / vtt / json writers
-  cli.py          # argument parsing + orchestration
+  cli.py          # argument parsing + orchestration (diarize / --tracks modes)
 tests/
   smoke.py        # model-free merge/format checks
   real_check.py   # faster-whisper word-timestamps -> merge (no HF token)

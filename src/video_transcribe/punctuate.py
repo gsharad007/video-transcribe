@@ -18,6 +18,18 @@ DEFAULT_PUNCT_MODEL = "pcs_en"
 # The model occasionally emits a literal <unk> token (e.g. for "mm-hmm"); strip it.
 _UNK = re.compile(r"<\s*unk\s*>", re.IGNORECASE)
 _SPACE_BEFORE_PUNCT = re.compile(r"\s+([,.!?;:])")
+# Punctuation the model re-adds itself; stripped from input (apostrophes/hyphens kept).
+_MODEL_PUNCT = re.compile(r"[.,!?;:…\"]")
+
+
+def _normalize_in(text: str) -> str:
+    """Prepare text for pcs_en, which expects lowercase, unpunctuated input.
+
+    Capital letters get tokenized as <unk> (dropping the leading letter), so we
+    lowercase and strip model-added punctuation; the model then re-cases and
+    re-punctuates from a clean slate.
+    """
+    return re.sub(r"\s+", " ", _MODEL_PUNCT.sub(" ", text)).strip().lower()
 
 
 def available() -> bool:
@@ -43,8 +55,9 @@ def restore(model, texts: list[str], *, batch_size: int = 32) -> list[str]:
     out: list[str] = []
     for i in range(0, len(texts), batch_size):
         chunk = texts[i:i + batch_size]
-        keep = [(j, t) for j, t in enumerate(chunk) if t and t.strip()]
-        results = model.infer([t for _, t in keep]) if keep else []
+        normalized = [(j, _normalize_in(t)) for j, t in enumerate(chunk)]
+        keep = [(j, n) for j, n in normalized if n]
+        results = model.infer([n for _, n in keep]) if keep else []
         restored = {
             j: _clean(" ".join(s.strip() for s in sents if s.strip()))
             for (j, _), sents in zip(keep, results)

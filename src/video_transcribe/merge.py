@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from video_transcribe.diarize import SpeakerTurn
-from video_transcribe.transcribe import Segment
+from video_transcribe.transcribe import Segment, TranscriptionResult
 
 # Phrases Whisper habitually hallucinates over silence/music/applause. Compared
 # case-insensitively after stripping punctuation; only *whole-segment* matches
@@ -156,34 +156,23 @@ def _group_indices(
     return groups
 
 
-def build_conversation(
+def _assemble(
     segments: list[Segment],
-    turns: list[SpeakerTurn],
+    seg_spk: list[str | None],
+    speakers: list[str],
     *,
-    tidy: bool = True,
-    punctuator: Punctuator | None = None,
+    tidy: bool,
+    punctuator: Punctuator | None,
 ) -> Conversation:
-    """Clean ASR output, assign speakers, restore punctuation, and group."""
-    segments = clean_segments(segments)
-
-    # 1. speaker per segment + friendly relabeling
-    if turns:
-        raw_spk = [_majority_speaker(s, turns) for s in segments]
-        names = _friendly_names(raw_spk)
-        seg_spk = [names.get(x) for x in raw_spk]
-        speakers = list(dict.fromkeys(names.values()))
-    else:
-        seg_spk = [None] * len(segments)
-        speakers = []
-
+    """Given segments (in display order) + a final per-segment speaker, build it."""
+    has_speakers = any(s is not None for s in seg_spk)
     raw = [s.text.strip() for s in segments]
 
-    # 2. group consecutive segments into utterances
-    groups = _group_indices(segments, seg_spk, diarized=bool(turns))
+    groups = _group_indices(segments, seg_spk, diarized=has_speakers)
     utt_raw = [" ".join(raw[i] for i in g["idxs"]) for g in groups]
 
-    # 3. readability: full-stream punctuation for utterances (correct sentence
-    #    boundaries) and per-segment punctuation for subtitle cues; else tidy.
+    # Full-stream punctuation for utterances (correct sentence boundaries) and
+    # per-segment punctuation for subtitle cues; else a light tidy.
     if punctuator is not None:
         utt_text = punctuator(utt_raw)
         seg_text = punctuator(raw)
@@ -195,7 +184,7 @@ def build_conversation(
         seg_text = raw
 
     diarized = [
-        DiarizedSegment(s.index, s.start, s.end, (seg_text[i].strip() or raw[i]), seg_spk[i])
+        DiarizedSegment(i, s.start, s.end, (seg_text[i].strip() or raw[i]), seg_spk[i])
         for i, s in enumerate(segments)
     ]
     utterances = [
@@ -203,3 +192,47 @@ def build_conversation(
         for k, g in enumerate(groups)
     ]
     return Conversation(segments=diarized, utterances=utterances, speakers=speakers)
+
+
+def build_conversation(
+    segments: list[Segment],
+    turns: list[SpeakerTurn],
+    *,
+    tidy: bool = True,
+    punctuator: Punctuator | None = None,
+) -> Conversation:
+    """Clean ASR output, assign speakers from diarization turns, and assemble."""
+    segments = clean_segments(segments)
+    if turns:
+        raw_spk = [_majority_speaker(s, turns) for s in segments]
+        names = _friendly_names(raw_spk)
+        seg_spk = [names.get(x) for x in raw_spk]
+        speakers = list(dict.fromkeys(names.values()))
+    else:
+        seg_spk = [None] * len(segments)
+        speakers = []
+    return _assemble(segments, seg_spk, speakers, tidy=tidy, punctuator=punctuator)
+
+
+def build_conversation_from_tracks(
+    track_results: list[tuple[str, TranscriptionResult]],
+    *,
+    tidy: bool = True,
+    punctuator: Punctuator | None = None,
+) -> Conversation:
+    """Merge per-track transcripts (each a fixed speaker) into one timeline.
+
+    `track_results` is a list of (speaker_label, TranscriptionResult). Each
+    track's segments are cleaned, tagged with that speaker, then all segments are
+    interleaved by start time -- no acoustic diarization needed, because the
+    speaker is known from which track the audio came from (e.g. mic vs desktop).
+    """
+    tagged: list[tuple[Segment, str]] = []
+    for speaker, result in track_results:
+        for seg in clean_segments(result.segments):
+            tagged.append((seg, speaker))
+    tagged.sort(key=lambda t: (t[0].start, t[0].end))
+    segments = [seg for seg, _ in tagged]
+    seg_spk = [spk for _, spk in tagged]
+    speakers = list(dict.fromkeys(seg_spk))
+    return _assemble(segments, seg_spk, speakers, tidy=tidy, punctuator=punctuator)
