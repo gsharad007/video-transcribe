@@ -125,6 +125,21 @@ def test_build_required_and_numeric_validation():
     print("[ok] build: required / integer / choice validation")
 
 
+def test_examples_valid():
+    total = 0
+    for key, task in CATALOG.items():
+        arg_names = {a.name for a in task.args}
+        for ex in task.examples:
+            total += 1
+            unknown = set(ex.values) - arg_names
+            assert not unknown, f"{key}: example references unknown args {unknown}"
+            # every example must build a complete, valid command
+            tokens = build_tokens(task, dict(ex.values))
+            assert tokens[:2] == list(task.argv_prefix[:2]), (key, tokens)
+    assert total >= 15, f"expected a healthy set of examples, got {total}"
+    print(f"[ok] examples: {total} runs, all reference real args and build cleanly")
+
+
 def test_split_paths():
     assert split_paths("a.mp4\nb.mp4\n") == ["a.mp4", "b.mp4"]
     assert split_paths("  C:\\My Videos\\talk.mp4  ") == ["C:\\My Videos\\talk.mp4"]
@@ -199,7 +214,14 @@ def test_tui_app_pilot():
             task = _CAT[app._selected]
             inputs = app.query("#arg-inputs")
             assert inputs, "form widgets did not mount"
-            # type a file into the real widget, then read it back through _collect
+            # clicking an example's Load button fills the form; read it back
+            assert app.query("#ex-0"), "example Load button did not mount"
+            await pilot.click("#ex-0")
+            await pilot.pause()
+            loaded = _build(task, app._collect(task))
+            expected = _build(task, dict(task.examples[0].values))
+            assert loaded == expected, (loaded, expected)
+            # and a manual edit still reads back through _collect
             inputs.first().load_text("clip.mp4")
             await pilot.pause()
             tokens = _build(task, app._collect(task))
@@ -213,9 +235,10 @@ def test_tui_app_pilot():
 
             # end-to-end: run the fast, dependency-free doctor task as a real
             # subprocess and confirm output streamed + a final state was recorded
-            app.query_one("#filter").value = "doctor"
+            app.query_one("#filter").value = ""
             await pilot.pause()
-            app._select_task("doctor")
+            await app._select_task("doctor")
+            await pilot.pause()
             app._maybe_run()
             for _ in range(200):  # up to ~10s; doctor takes well under 1s
                 await pilot.pause(0.05)
@@ -236,6 +259,7 @@ if __name__ == "__main__":
     test_build_changed_values_and_flags()
     test_build_prefix_flags_preserved()
     test_build_required_and_numeric_validation()
+    test_examples_valid()
     test_split_paths()
     test_demux_committed_lines_crlf()
     test_demux_transient_progress()

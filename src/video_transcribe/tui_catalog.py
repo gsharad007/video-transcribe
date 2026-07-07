@@ -14,7 +14,7 @@ are ordered so the everyday transcription jobs come first.
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from video_transcribe.diarize import DEFAULT_DIARIZE_MODEL
@@ -22,6 +22,7 @@ from video_transcribe.voiceprint import DEFAULT_MATCH_THRESHOLD
 
 __all__ = (
     "Arg",
+    "Example",
     "Task",
     "CATALOG",
     "CATEGORY_ORDER",
@@ -69,6 +70,18 @@ class Arg:
 
 
 @dataclass(frozen=True, slots=True)
+class Example:
+    """A ready-made run for a task: a one-line note plus a partial map of
+    ``arg name -> value`` (unset args fall back to their defaults). The TUI shows
+    the note + the exact command it builds, and can load the values into the
+    form. ``values`` must reference only real arg names of the owning task -- the
+    ``tui_check`` suite enforces that and that every example builds cleanly."""
+
+    note: str
+    values: dict[str, str | bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class Task:
     key: str
     label: str
@@ -77,6 +90,7 @@ class Task:
     argv_prefix: tuple[str, ...]
     args: tuple[Arg, ...] = ()
     tags: tuple[str, ...] = field(default_factory=tuple)
+    examples: tuple[Example, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -444,4 +458,82 @@ _TASKS: tuple[Task, ...] = (
     ),
 )
 
-CATALOG: dict[str, Task] = {task.key: task for task in _TASKS}
+# Ready-made runs shown in the TUI, grounded in this project's actual usage:
+# AMD ReLive recordings (video + a "Separate Microphone Track"), a shared
+# glossary for term/name fixes, and a Claude correction pass over the result --
+# plus the canonical examples from the README. File names are placeholders;
+# edit the paths in the form before running.
+_EXAMPLES: dict[str, tuple[Example, ...]] = {
+    "transcribe": (
+        Example("Highest quality (large-v3); transcript beside the input",
+                {"inputs": "talk.mp4"}),
+        Example("Faster (turbo), force English, also write SRT",
+                {"inputs": "clip.mp4", "model": "large-v3-turbo", "language": "en",
+                 "format": "txt,srt"}),
+        Example("Single presenter -- label the whole transcript with one name",
+                {"inputs": "lecture.mp4", "speaker": "Sharad"}),
+    ),
+    "diarize": (
+        Example("Label speakers (needs an HF token); write txt + srt",
+                {"inputs": "meeting.mp4", "format": "txt,srt"}),
+        Example("Tell pyannote there are exactly 2 speakers",
+                {"inputs": "interview.mp4", "speakers": "2"}),
+        Example("Auto-name known voices from a voiceprint store",
+                {"inputs": "meeting.mp4", "speakers": "4", "voiceprints": "voiceprints.json"}),
+    ),
+    "list-tracks": (
+        Example("Inspect a ReLive recording's audio tracks (find the indices)",
+                {"inputs": "meeting.mp4"}),
+    ),
+    "tracks-in-file": (
+        Example("ReLive mic muxed into the video: label exactly by track",
+                {"inputs": "meeting.mp4", "tracks": "0=Mar,1=Sharad"}),
+    ),
+    "tracks-files": (
+        Example("Video + separate mic file, merged by timestamp",
+                {"inputs": "meeting.mp4\nmeeting.m4a", "track_speakers": "Mar,Sharad"}),
+        Example("...and also write one combined .mkv (Mix + Desktop + Mic)",
+                {"inputs": "meeting.mp4\nmeeting.m4a", "track_speakers": "Mar,Sharad", "mux": True}),
+    ),
+    "hybrid": (
+        Example("Group call (diarize file 0) + your own separate mic",
+                {"inputs": "meeting.mp4\nmeeting.m4a", "diarize_track": "0",
+                 "speakers": "4", "track_speakers": "Sharad"}),
+    ),
+    "correct": (
+        Example("Apply glossary term fixes + speaker names to a transcript",
+                {"input": "meeting.json", "glossary": "g.json"}),
+        Example("Override just the speaker names for this run",
+                {"input": "meeting.json", "glossary": "g.json",
+                 "speakers": "Speaker 1=JV,Speaker 2=Sharad"}),
+    ),
+    "llm-correct": (
+        Example("Claude fixes misheard names/jargon, using a glossary for context",
+                {"input": "meeting.json", "glossary": "g.json"}),
+        Example("Plain correction pass, no glossary",
+                {"input": "meeting.json"}),
+    ),
+    "voiceprint-list": (
+        Example("See who's enrolled and how many samples each has",
+                {"store": "voiceprints.json"}),
+    ),
+    "voiceprint-enroll": (
+        Example("Enroll everyone from an already-corrected transcript",
+                {"transcript": "meeting.json", "media": "meeting.mp4", "store": "voiceprints.json"}),
+        Example("Enroll named people from the Desktop track of a muxed .mkv",
+                {"transcript": "meeting.json", "media": "meeting.with-mic.mkv",
+                 "store": "voiceprints.json", "names": "Ryan,Mar,Ness,John", "track": "1"}),
+    ),
+    "voiceprint-validate": (
+        Example("Sanity-check the store against a confirmed transcript",
+                {"transcript": "meeting.json", "media": "meeting.mp4", "store": "voiceprints.json"}),
+    ),
+    "mux": (
+        Example("Merge video + separate mic into one playable .mkv",
+                {"video": "meeting.mp4", "mic": "meeting.m4a"}),
+    ),
+}
+
+CATALOG: dict[str, Task] = {
+    task.key: replace(task, examples=_EXAMPLES.get(task.key, ())) for task in _TASKS
+}

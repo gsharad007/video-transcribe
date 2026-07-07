@@ -47,8 +47,11 @@ uv run video-transcribe-tui  # launch
   Transcribe · Transcribe + diarize · List audio tracks · by-track modes ·
   Correct (glossary / LLM) · Voiceprints (list / enroll / validate) · Mux ·
   Environment doctor. Type to fuzzy-filter.
-- **Right:** one widget per CLI option (files, dropdowns, switches), a live
-  `$ python -m video_transcribe …` preview of the command, and **Run** / **Stop**.
+- **Right:** ready-made **examples** for each task (the common runs from this
+  project — ReLive separate-mic, diarize, glossary/LLM correction, voiceprints);
+  click **Load** to drop one into the form. Below them, one widget per CLI option
+  (files, dropdowns, switches), a live `$ python -m video_transcribe …` preview of
+  the command, and **Run** / **Stop**.
 - **Bottom:** a live progress line (Whisper/pyannote/download bars animate in
   place) over a full, colour-highlighted scrollback log. `w` saves the log,
   `y` copies it, `c` clears it.

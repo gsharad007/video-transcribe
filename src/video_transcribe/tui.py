@@ -34,6 +34,7 @@ from video_transcribe.tui_catalog import (
     CATALOG,
     CATEGORY_LABELS,
     Arg,
+    Example,
     Task,
     ValidationError,
     build_tokens,
@@ -138,6 +139,15 @@ def _quote(token: str) -> str:
     return f'"{token}"' if (not token or " " in token) else token
 
 
+def _example_command(task: Task, example: Example) -> str:
+    """The exact `python -m ...` command an example builds, for display."""
+    try:
+        tokens = build_tokens(task, dict(example.values))
+    except ValidationError as e:  # an example that doesn't fill a required field
+        return f"[#FF8A8A]incomplete example:[/] {e}"
+    return "python " + " ".join(_quote(t) for t in tokens)
+
+
 def _arg_widget(arg: Arg) -> Widget:
     wid = f"arg-{arg.name}"
     if arg.kind == "bool":
@@ -210,6 +220,11 @@ class TranscribeTUI(App[int]):
     .arg-block { height: auto; margin-bottom: 1; }
     .arg-label { color: $text; height: auto; }
     .paths-area { height: 4; border: round $panel; }
+    .examples-header { color: $accent; text-style: bold; margin-bottom: 1; }
+    .example-block { height: auto; margin-bottom: 1; }
+    .example-block .example-cmd { color: $text-muted; height: auto; }
+    .example-block Button { min-width: 8; height: 1; margin: 0 1 0 0; border: none; }
+    .options-header { color: $accent; text-style: bold; margin: 1 0; }
     """
 
     BINDINGS: ClassVar = [
@@ -262,7 +277,7 @@ class TranscribeTUI(App[int]):
         first = next(iter(CATALOG), None)
         if first is not None:
             list_view.index = 1  # row 0 is a category header
-            self._select_task(first)
+            await self._select_task(first)
 
     async def on_unmount(self) -> None:
         for run in list(self._runs.values()):
@@ -298,26 +313,35 @@ class TranscribeTUI(App[int]):
                 return i
         return None
 
-    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+    async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if event.item is None or event.item.id is None:
             return
-        if event.item.id.startswith("task-"):
-            self._select_task(event.item.id.removeprefix("task-"))
+        if not event.item.id.startswith("task-"):
+            return
+        key = event.item.id.removeprefix("task-")
+        if key != self._selected:  # ignore re-highlights of the current selection
+            await self._select_task(key)
 
-    def _select_task(self, key: str) -> None:
+    async def _select_task(self, key: str) -> None:
         self._selected = key
         task = CATALOG[key]
         self.query_one("#task-summary", Static).update(f"[b]{task.label}[/]\n{task.summary}")
-        self._rebuild_form(task)
+        await self._rebuild_form(task)
         self._refresh_buttons()
         self._update_preview()
 
-    def _rebuild_form(self, task: Task) -> None:
+    async def _rebuild_form(self, task: Task) -> None:
         form = self.query_one("#form-area", VerticalScroll)
-        form.remove_children()
+        # Await the removal: mounting the next task's widgets before the old ones
+        # are gone raises DuplicateIds, since arg ids (arg-inputs) and example ids
+        # (ex-0) recur across tasks.
+        await form.remove_children()
+        self._mount_examples(task)
         if not task.args:
             form.mount(Static("[dim]No options — just run it.[/]"))
             return
+        if task.examples:
+            form.mount(Static("Options", classes="options-header"))
         for arg in task.args:
             block = Vertical(classes="arg-block")
             form.mount(block)
@@ -326,6 +350,44 @@ class TranscribeTUI(App[int]):
             block.mount(Static(f"[b]{arg.name}[/]{star}{kind}  [dim]{arg.help}[/]",
                                classes="arg-label"))
             block.mount(_arg_widget(arg))
+
+    def _mount_examples(self, task: Task) -> None:
+        """Show each example as its note + the exact command it builds, with a
+        'Load' button that fills the form below. These are the common runs from
+        this project's usage; the paths are placeholders to edit before running."""
+        if not task.examples:
+            return
+        form = self.query_one("#form-area", VerticalScroll)
+        form.mount(Static("Examples — click Load, then edit the paths", classes="examples-header"))
+        for i, example in enumerate(task.examples):
+            block = Vertical(classes="example-block")
+            form.mount(block)
+            row = Horizontal()
+            block.mount(row)
+            row.mount(Button("Load", id=f"ex-{i}", variant="success"))
+            row.mount(Static(f" {example.note}"))
+            block.mount(Static(f"[dim]$[/] {_example_command(task, example)}",
+                               classes="example-cmd"))
+
+    def _apply_values(self, task: Task, values: FormValues) -> None:
+        """Set every arg widget to its example value (or its default when the
+        example doesn't mention it), so loading an example gives exactly that
+        command with no leftovers from a previous edit."""
+        for arg in task.args:
+            value = values.get(arg.name, arg.default)
+            try:
+                widget = self.query_one(f"#arg-{arg.name}", Widget)
+            except NoMatches:
+                continue
+            if isinstance(widget, Switch):
+                widget.value = bool(value)
+            elif isinstance(widget, Select):
+                widget.value = str(value)
+            elif isinstance(widget, TextArea):
+                widget.load_text(str(value))
+            elif isinstance(widget, Input):
+                widget.value = str(value)
+        self._update_preview()
 
     # -- form reading / preview ------------------------------------------- #
 
@@ -418,12 +480,18 @@ class TranscribeTUI(App[int]):
     # -- buttons / actions ------------------------------------------------- #
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "run-button":
+        button_id = event.button.id or ""
+        if button_id == "run-button":
             self._maybe_run()
-        elif event.button.id == "stop-button":
+        elif button_id == "stop-button":
             self._maybe_stop()
-        elif event.button.id == "clear-button":
+        elif button_id == "clear-button":
             self.action_clear_log()
+        elif button_id.startswith("ex-") and self._selected is not None:
+            task = CATALOG[self._selected]
+            example = task.examples[int(button_id.removeprefix("ex-"))]
+            self._apply_values(task, dict(example.values))
+            self._log(f"[{task.key}] loaded example: {example.note}")
 
     def action_run_task(self) -> None:
         self._maybe_run()
