@@ -5,6 +5,8 @@ Two Windows-specific notes baked in here:
 * pyannote 4.x decodes audio through `torchcodec`, whose native DLLs are flaky
   on Windows. We dodge that entirely by reading the (known 16 kHz mono PCM) WAV
   with the stdlib `wave` module and handing pyannote an in-memory waveform.
+  `load_waveform` is public so other pyannote-based callers (e.g. voiceprint.py)
+  can reuse the same workaround.
 * The diarization model is gated on Hugging Face, so it needs a free token plus
   one-time acceptance of the model terms; `DiarizationError` explains how.
 
@@ -33,7 +35,7 @@ class DiarizationError(RuntimeError):
     """Raised when the diarization model can't be loaded or run."""
 
 
-def _load_waveform(wav_path: Path):
+def load_waveform(wav_path: Path):
     """Read a 16-bit PCM WAV into a (channels, time) float32 torch tensor."""
     import numpy as np
     import torch
@@ -101,7 +103,7 @@ def run_pipeline(
     max_speakers: int | None = None,
 ) -> list[SpeakerTurn]:
     """Run a loaded pipeline over a WAV and return sorted speaker turns."""
-    waveform, sample_rate = _load_waveform(Path(wav_path))
+    waveform, sample_rate = load_waveform(Path(wav_path))
 
     kwargs: dict[str, int] = {}
     if num_speakers is not None:

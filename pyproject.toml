@@ -23,6 +23,12 @@ diarize = [
 readable = [
     "punctuators>=0.0.5",
 ]
+# Optional LLM-assisted correction pass (video_transcribe.llm_correct) -- sends
+# transcript text to the Claude API. Needs ANTHROPIC_API_KEY (or `ant auth login`).
+# Install with:  uv sync --extra llm
+llm = [
+    "anthropic>=0.69",
+]
 
 [project.scripts]
 video-transcribe = "video_transcribe.cli:main"

@@ -115,12 +115,26 @@ def _tidy(text: str) -> str:
     return text
 
 
-def _friendly_names(raw_speakers: list[str | None]) -> dict[str, str]:
-    """Map raw pyannote labels to 'Speaker 1', 'Speaker 2', ... by first appearance."""
+def _friendly_names(
+    raw_speakers: list[str | None], known: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Map raw pyannote labels to names.
+
+    A label present in `known` (e.g. a confident voiceprint match) gets that
+    real name; every other label gets 'Speaker 1', 'Speaker 2', ... numbered
+    by first appearance among the *unmatched* labels only.
+    """
+    known = known or {}
     mapping: dict[str, str] = {}
+    n = 0
     for spk in raw_speakers:
-        if spk is not None and spk not in mapping:
-            mapping[spk] = f"Speaker {len(mapping) + 1}"
+        if spk is None or spk in mapping:
+            continue
+        if spk in known:
+            mapping[spk] = known[spk]
+        else:
+            n += 1
+            mapping[spk] = f"Speaker {n}"
     return mapping
 
 
@@ -200,12 +214,18 @@ def build_conversation(
     *,
     tidy: bool = True,
     punctuator: Punctuator | None = None,
+    voice_names: dict[str, str] | None = None,
 ) -> Conversation:
-    """Clean ASR output, assign speakers from diarization turns, and assemble."""
+    """Clean ASR output, assign speakers from diarization turns, and assemble.
+
+    `voice_names` maps raw pyannote labels to real names (e.g. from a confident
+    voiceprint match, see voiceprint.py) -- labels not in it fall back to the
+    generic 'Speaker N'.
+    """
     segments = clean_segments(segments)
     if turns:
         raw_spk = [_majority_speaker(s, turns) for s in segments]
-        names = _friendly_names(raw_spk)
+        names = _friendly_names(raw_spk, voice_names)
         seg_spk = [names.get(x) for x in raw_spk]
         speakers = list(dict.fromkeys(names.values()))
     else:
@@ -227,12 +247,49 @@ def build_conversation_from_tracks(
     interleaved by start time -- no acoustic diarization needed, because the
     speaker is known from which track the audio came from (e.g. mic vs desktop).
     """
-    tagged: list[tuple[Segment, str]] = []
-    for speaker, result in track_results:
-        for seg in clean_segments(result.segments):
-            tagged.append((seg, speaker))
+    tagged_tracks = [
+        [(seg, speaker) for seg in clean_segments(result.segments)]
+        for speaker, result in track_results
+    ]
+    return build_conversation_from_tagged(tagged_tracks, tidy=tidy, punctuator=punctuator)
+
+
+def diarized_track(
+    result: TranscriptionResult, turns: list[SpeakerTurn],
+    *, voice_names: dict[str, str] | None = None,
+) -> list[tuple[Segment, str | None]]:
+    """Clean a track's segments and tag each with its acoustically diarized speaker.
+
+    Used for a track that itself mixes multiple people (e.g. a group meeting's
+    desktop/system audio), as opposed to a track that is already a single known
+    speaker. Speakers come out as friendly labels ("Speaker 1", "Speaker 2", ...)
+    by order of first appearance -- rename them afterwards (e.g. via correct.py) --
+    unless `voice_names` (a confident voiceprint match, see voiceprint.py) already
+    resolves a label to a real name.
+    """
+    segments = clean_segments(result.segments)
+    if not turns:
+        return [(s, None) for s in segments]
+    raw_spk = [_majority_speaker(s, turns) for s in segments]
+    names = _friendly_names(raw_spk, voice_names)
+    return [(s, names.get(r)) for s, r in zip(segments, raw_spk)]
+
+
+def build_conversation_from_tagged(
+    tagged_tracks: list[list[tuple[Segment, str | None]]],
+    *,
+    tidy: bool = True,
+    punctuator: Punctuator | None = None,
+) -> Conversation:
+    """Merge several already speaker-tagged tracks into one timeline.
+
+    Lets a diarized track (`diarized_track`, multiple speakers) and fixed-speaker
+    tracks (one name per track, e.g. a separate mic) be combined into a single
+    conversation ordered by start time.
+    """
+    tagged = [pair for track in tagged_tracks for pair in track]
     tagged.sort(key=lambda t: (t[0].start, t[0].end))
     segments = [seg for seg, _ in tagged]
     seg_spk = [spk for _, spk in tagged]
-    speakers = list(dict.fromkeys(seg_spk))
+    speakers = list(dict.fromkeys(spk for spk in seg_spk if spk is not None))
     return _assemble(segments, seg_spk, speakers, tidy=tidy, punctuator=punctuator)

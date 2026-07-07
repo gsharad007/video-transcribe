@@ -25,6 +25,9 @@ uv sync --extra diarize --extra readable  # + speaker labels + punctuation (full
 - `readable` pulls in `punctuators` (tiny — reuses the onnxruntime faster-whisper
   already installs); enables sentence/punctuation restoration. On by default when
   installed; disable per-run with `--no-punctuate`.
+- `llm` pulls in the `anthropic` SDK; needed for the optional
+  `llm_correct.py` correction pass (sends transcript text to the Claude API —
+  see below). Not needed for anything else in this tool.
 
 ## Usage
 
@@ -104,6 +107,20 @@ Each track is transcribed independently and merged by timestamp — **exact** sp
 attribution (no guessing), faster (no pyannote/word-timestamps), no alignment
 artifacts. Record with **headphones** so your mic doesn't pick up the other side.
 
+**Group call + separate mic** (the other side is *several* people mixed into one
+track, but you were captured on your own mic): diarize just that one input and
+label the rest by track.
+```pwsh
+uv run video-transcribe meeting.mp4 meeting.m4a \
+  --diarize-track 0 --speakers 4 --track-speakers "Sharad"
+```
+`--diarize-track 0` acoustically diarizes input file 0's audio (up to
+`--speakers`/`--min-speakers`/`--max-speakers` people); `--track-speakers` names
+the *other* input file(s), one name per remaining file, in order. Diarized
+speakers come out generic (`Speaker 1`, `Speaker 2`, ...) — match voices to names
+and rename with `correct.py` afterwards, or auto-name them by voice (see
+Voiceprints below). `--mux` works the same way here too.
+
 ### Merge video + separate mic into one playable file
 
 Standard players play only one audio track at a time, so to get a file where
@@ -119,6 +136,102 @@ uv run python -m video_transcribe.mux meeting.mp4 meeting.m4a   # -> meeting.wit
 ```
 
 The video is stream-copied (no re-encode); only the small Mix track is encoded.
+
+## Voiceprints (optional, auto-identify diarized speakers by voice)
+
+Diarization always starts out generic (`Speaker 1`, `Speaker 2`, ...) — matching
+voices to names by listening/reading is a one-time cost per *person*, not per
+meeting. `voiceprint.py` makes that permanent: enroll a few confirmed segments
+per person once, and future diarized recordings get auto-labeled with their
+real name instead of a generic placeholder.
+
+Fully local — embeddings never leave the machine, and it reuses the embedding
+model already bundled inside the diarization pipeline (no extra Hugging Face
+gating beyond what `--diarize` already needs).
+
+**Enroll** from a transcript you've already confirmed is correctly named (e.g.
+after `correct.py`), pointing at whichever audio/video file that speech
+actually came from:
+
+```pwsh
+# from a plain diarized recording:
+uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.mp4 \
+  --store voiceprints.json
+
+# from a hybrid video+mic transcript, restrict to the names that actually live
+# in *that* file (--list-tracks on the main CLI shows track indices):
+uv run video-transcribe meeting.with-mic.mkv --list-tracks
+uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.with-mic.mkv \
+  --store voiceprints.json --names "Ryan,Mar,Ness,John" --track 1   # Desktop
+uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.with-mic.mkv \
+  --store voiceprints.json --names "Sharad" --track 2               # Mic
+
+uv run python -m video_transcribe.voiceprint list --store voiceprints.json
+```
+
+**Identify** on future recordings by passing the store to the main CLI —
+diarized speakers that confidently match a known voice come out named
+directly; anyone else still falls back to generic `Speaker N`:
+
+```pwsh
+uv run video-transcribe meeting.mp4 --diarize --speakers 4 --voiceprints voiceprints.json
+```
+
+Assignment is **one-to-one**: each enrolled person can win at most one
+diarized speaker per recording, greedily by best score. This matters — the
+person with the most enrollment samples otherwise tends to out-score the true
+speaker on several clusters at once (measured on a ground-truth meeting: 3/5
+speakers correct with independent matching vs 5/5 with exclusive assignment).
+`--voice-threshold` (default `0.5`, cosine similarity) mainly guards against
+matching people who aren't enrolled at all — raise it if an unknown voice
+gets a name it shouldn't, lower it if an obviously correct match is being
+left generic. There's a `validate` subcommand to check the store against a
+transcript whose names you've already confirmed, and
+`tests/eval_matching.py` to compare scoring variants offline:
+
+```pwsh
+uv run python -m video_transcribe.voiceprint validate meeting.json meeting.mp4 --store voiceprints.json
+```
+
+This is **self-learning** by habit, not automatically: every time you confirm
+a `correct.py` mapping is right, enroll that transcript too, and accuracy
+compounds the more the tool is used.
+
+The store is just a JSON file of embedding vectors per name — small, but it
+*is* biometric-ish data about named real people, so keep it out of version
+control and anywhere you wouldn't put a phone book with voice tags (a location
+outside any git repo works well).
+
+## LLM-assisted correction (optional, sends text to Claude)
+
+`correct.py` fixes known terms via a fixed glossary (deterministic, fully
+local). For everything else — misheard names/jargon not yet in the glossary,
+odd ASR homophone slips — `llm_correct.py` runs those utterances past the
+Claude API as a **correction-only** pass: it's instructed to fix mishearings
+and obvious ASR errors and nothing else (no rewriting, summarizing, merging,
+or inventing content), and it must return one corrected string per input
+utterance so the result stays 1:1 with the original.
+
+```pwsh
+uv sync --extra llm                          # installs the anthropic SDK
+uv run python -m video_transcribe.llm_correct meeting.json --glossary g.json
+```
+
+Needs `ANTHROPIC_API_KEY` (or `ant auth login`). Output goes to **separate**
+files next to the input, so nothing is overwritten and corrections are easy to
+review:
+
+- `meeting.llm.txt` / `meeting.llm.json` — the corrected transcript
+- `meeting.llm-changes.txt` — only the utterances that changed, old → new
+
+Only utterance-level text (the paragraph grain in `.txt`/`.json`) is
+corrected; segments (the subtitle-cue grain used for `.srt`/`.vtt`) aren't
+touched, so this tool only writes `txt`/`json`. Costs roughly a few cents per
+meeting on the default model (`claude-opus-4-8`; override with `--model`).
+
+**Privacy note:** unlike the rest of this pipeline (fully local), this sends
+the transcript text — including names and meeting content — to Anthropic's
+API. Skip it for anything that shouldn't leave the machine.
 
 ## Speaker diarization setup (one time)
 
@@ -161,6 +274,7 @@ src/video_transcribe/
   merge.py        # assign speakers (diarization OR per-track), clean, regroup
   punctuate.py    # optional sentence/punctuation restoration (punctuators/ONNX)
   correct.py      # apply a glossary (term fixes + speaker names) to a transcript
+  llm_correct.py  # optional Claude-API correction pass (separate .llm.* output)
   mux.py          # merge video + separate mic -> one MKV (Mix/Desktop/Mic)
   formats.py      # readable txt + srt / vtt / json writers
   cli.py          # argument parsing + orchestration (diarize / tracks / mux)

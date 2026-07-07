@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-from video_transcribe import __version__, audio, diarize, formats, merge, punctuate
+from video_transcribe import __version__, audio, diarize, formats, merge, punctuate, voiceprint
 from video_transcribe.transcribe import Segment, load_model, transcribe
 
 EXT = {"txt": ".txt", "srt": ".srt", "vtt": ".vtt", "json": ".json"}
@@ -117,6 +117,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Exact number of speakers, if known.")
     g.add_argument("--min-speakers", type=int, default=None, help="Lower bound on speakers.")
     g.add_argument("--max-speakers", type=int, default=None, help="Upper bound on speakers.")
+    g.add_argument("--voiceprints", type=Path, default=None, metavar="STORE",
+                   help="Voiceprint store (see voiceprint.py) to auto-name diarized "
+                        "speakers by voice; unmatched speakers still fall back to "
+                        "generic 'Speaker N'.")
+    g.add_argument("--voice-threshold", type=float, default=voiceprint.DEFAULT_MATCH_THRESHOLD,
+                   help="Cosine-similarity threshold for a confident voice match "
+                        f"(default: {voiceprint.DEFAULT_MATCH_THRESHOLD}).")
 
     t = p.add_argument_group("multi-track input (e.g. ReLive 'Separate Microphone Track')")
     t.add_argument("--tracks", default=None, metavar="MAP",
@@ -132,6 +139,14 @@ def _build_parser() -> argparse.ArgumentParser:
     t.add_argument("--mux", action="store_true",
                    help="With --track-speakers on a video+mic pair, also write one .mkv "
                         "with Mix (default) + Desktop + Mic audio tracks.")
+    t.add_argument("--diarize-track", type=int, default=None, metavar="IDX",
+                   help="Index (0-based) of the input file whose audio should be "
+                        "acoustically diarized into multiple speakers (e.g. a group "
+                        "meeting's video, mixing several people), while the *other* "
+                        "input file(s) are fixed single-speaker tracks named via "
+                        "--track-speakers (e.g. your own separate mic). Diarized "
+                        "speakers come out as 'Speaker 1', 'Speaker 2', ... -- rename "
+                        "with correct.py. Combine with --speakers/--min/--max-speakers.")
 
     p.add_argument("--keep-audio", action="store_true",
                    help="Keep the intermediate 16 kHz WAV alongside the output.")
@@ -186,6 +201,7 @@ def _transcribe_one(inp: Path, args: argparse.Namespace, fmts: list[str],
              f"{len(result.segments)} segments over {result.duration:.0f}s")
 
         turns = []
+        voice_names: dict[str, str] = {}
         if pipeline is not None:
             _log(args.quiet, "    diarizing speakers (slow on CPU) ...")
             turns = diarize.run_pipeline(
@@ -196,11 +212,19 @@ def _transcribe_one(inp: Path, args: argparse.Namespace, fmts: list[str],
             )
             n = len({t.speaker for t in turns})
             _log(args.quiet, f"    found {n} speaker(s) across {len(turns)} turns")
+            if args.voice_ctx is not None:
+                embedder, store, threshold = args.voice_ctx
+                waveform, sample_rate = diarize.load_waveform(wav)
+                voice_names = voiceprint.identify_turns(
+                    turns, waveform, sample_rate, embedder, store, threshold=threshold,
+                )
+                if voice_names:
+                    _log(args.quiet, f"    voice-matched: {', '.join(sorted(voice_names.values()))}")
 
     if punctuator is not None and not args.quiet:
         print("    restoring punctuation ...", file=sys.stderr)
-    conv = merge.build_conversation(result.segments, turns,
-                                    tidy=not args.no_tidy, punctuator=punctuator)
+    conv = merge.build_conversation(result.segments, turns, tidy=not args.no_tidy,
+                                    punctuator=punctuator, voice_names=voice_names)
     if args.speaker and not turns:
         conv = replace(
             conv,
@@ -342,18 +366,121 @@ def _transcribe_merged_files(inputs: list[Path], names: list[str],
         _log(args.quiet, f"    wrote {out_path}")
 
     if args.mux:
-        flags = [audio.has_video(i) for i in inputs]
-        videos = [i for i, v in zip(inputs, flags) if v]
-        mics = [i for i, v in zip(inputs, flags) if not v]
-        if len(videos) == 1 and len(mics) == 1:
-            mkv = out_dir / (videos[0].stem + ".with-mic.mkv")
-            _log(args.quiet, f"    muxing video + mic -> {mkv.name} (copies the video) ...")
-            audio.mux_tracks(videos[0], mics[0], mkv)
-            _log(args.quiet, f"    wrote {mkv}")
-        else:
-            print(f"warning: --mux needs one video + one audio-only (mic) input "
-                  f"(found {len(videos)} video / {len(mics)} audio); skipping mux",
-                  file=sys.stderr)
+        _maybe_mux(inputs, out_dir, args.quiet)
+    return 0
+
+
+def _maybe_mux(inputs: list[Path], out_dir: Path, quiet: bool) -> None:
+    """If `inputs` is exactly one video + one audio-only (mic) file, mux them."""
+    flags = [audio.has_video(i) for i in inputs]
+    videos = [i for i, v in zip(inputs, flags) if v]
+    mics = [i for i, v in zip(inputs, flags) if not v]
+    if len(videos) == 1 and len(mics) == 1:
+        mkv = out_dir / (videos[0].stem + ".with-mic.mkv")
+        _log(quiet, f"    muxing video + mic -> {mkv.name} (copies the video) ...")
+        audio.mux_tracks(videos[0], mics[0], mkv)
+        _log(quiet, f"    wrote {mkv}")
+    else:
+        print(f"warning: --mux needs one video + one audio-only (mic) input "
+              f"(found {len(videos)} video / {len(mics)} audio); skipping mux",
+              file=sys.stderr)
+
+
+def _transcribe_hybrid(inputs: list[Path], diarize_idx: int, names: list[str],
+                       args: argparse.Namespace, fmts: list[str],
+                       model, pipeline, punctuator) -> int:
+    """One input is acoustically diarized (e.g. a group meeting's video, with
+    several people); the rest are fixed single-speaker tracks (e.g. a separate
+    mic), merged by timestamp into one conversation.
+    """
+    if not 0 <= diarize_idx < len(inputs):
+        print(f"error: --diarize-track {diarize_idx} is out of range for "
+              f"{len(inputs)} input file(s)", file=sys.stderr)
+        return 1
+    others = [i for i in range(len(inputs)) if i != diarize_idx]
+    if len(names) != len(others):
+        print(f"error: --track-speakers has {len(names)} name(s) but {len(others)} "
+              f"non-diarized input file(s); they must match", file=sys.stderr)
+        return 1
+    for inp in inputs:
+        if not inp.exists():
+            print(f"error: file not found: {inp}", file=sys.stderr)
+            return 1
+
+    out_dir = args.output_dir or inputs[0].parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tagged_tracks: list[list[tuple[Segment, str | None]]] = [[] for _ in inputs]
+    results: dict[int, object] = {}
+    with tempfile.TemporaryDirectory(prefix="video-transcribe-") as tmp:
+        inp = inputs[diarize_idx]
+        wav = Path(tmp) / (inp.stem + ".16k.wav")
+        _log(args.quiet, f"==> {inp.name}: extracting + transcribing (diarized) ...")
+        audio.extract_audio(inp, wav)
+        result = transcribe(
+            wav, model=model, model_size=args.model,
+            language=args.language, vad_filter=not args.no_vad,
+            word_timestamps=True, hotwords=args.hotwords_resolved,
+            progress=_make_progress(args.quiet, args.verbose),
+        )
+        if not args.quiet and not args.verbose:
+            print("", file=sys.stderr)
+        _log(args.quiet, "    diarizing speakers (slow on CPU) ...")
+        turns = diarize.run_pipeline(
+            pipeline, wav, num_speakers=args.speakers,
+            min_speakers=args.min_speakers, max_speakers=args.max_speakers,
+        )
+        voice_names: dict[str, str] = {}
+        if args.voice_ctx is not None:
+            embedder, store, threshold = args.voice_ctx
+            waveform, sample_rate = diarize.load_waveform(wav)
+            voice_names = voiceprint.identify_turns(
+                turns, waveform, sample_rate, embedder, store, threshold=threshold,
+            )
+            if voice_names:
+                _log(args.quiet, f"    voice-matched: {', '.join(sorted(voice_names.values()))}")
+        tagged_tracks[diarize_idx] = merge.diarized_track(result, turns, voice_names=voice_names)
+        n = len({spk for _, spk in tagged_tracks[diarize_idx] if spk is not None})
+        _log(args.quiet, f"    {inp.name}: {len(result.segments)} segments, "
+                         f"{n} speaker(s) over {result.duration:.0f}s")
+        results[diarize_idx] = result
+
+        for idx, name in zip(others, names):
+            inp2 = inputs[idx]
+            wav2 = Path(tmp) / (inp2.stem + ".16k.wav")
+            _log(args.quiet, f"==> {name}: {inp2.name}: extracting + transcribing ...")
+            audio.extract_audio(inp2, wav2)
+            result2 = transcribe(
+                wav2, model=model, model_size=args.model,
+                language=args.language, vad_filter=not args.no_vad,
+                hotwords=args.hotwords_resolved,
+                progress=_make_progress(args.quiet, args.verbose),
+            )
+            if not args.quiet and not args.verbose:
+                print("", file=sys.stderr)
+            _log(args.quiet, f"    {name}: {len(result2.segments)} segments over "
+                             f"{result2.duration:.0f}s")
+            tagged_tracks[idx] = [(s, name) for s in merge.clean_segments(result2.segments)]
+            results[idx] = result2
+
+    if punctuator is not None and not args.quiet:
+        print("    restoring punctuation ...", file=sys.stderr)
+    conv = merge.build_conversation_from_tagged(tagged_tracks, tidy=not args.no_tidy,
+                                                punctuator=punctuator)
+    meta = formats.Meta(
+        title=inputs[diarize_idx].name,
+        language=results[diarize_idx].language,
+        duration=max(r.duration for r in results.values()),
+        model=args.model,
+        diarized=True,
+    )
+    for fmt in fmts:
+        out_path = out_dir / (inputs[diarize_idx].stem + EXT[fmt])
+        out_path.write_text(formats.WRITERS[fmt](conv, meta), encoding="utf-8")
+        _log(args.quiet, f"    wrote {out_path}")
+
+    if args.mux:
+        _maybe_mux(inputs, out_dir, args.quiet)
     return 0
 
 
@@ -363,6 +490,12 @@ def main(argv: list[str] | None = None) -> int:
     track_map = _parse_tracks(args.tracks) if args.tracks else None
     track_speakers = ([n.strip() for n in args.track_speakers.split(",") if n.strip()]
                       if args.track_speakers else None)
+    diarize_idx = args.diarize_track
+
+    if diarize_idx is not None and track_speakers is None:
+        print("error: --diarize-track requires --track-speakers for the other "
+              "input file(s)", file=sys.stderr)
+        return 1
 
     pipeline = None
     model = None
@@ -377,17 +510,33 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if track_map is not None or track_speakers is not None:
-            if args.diarize:
+            if args.diarize and diarize_idx is None:
                 _log(args.quiet, "note: --diarize is ignored in track mode "
                                  "(speakers come from the tracks)")
             _log(args.quiet, f"loading model '{args.model}' "
                              f"({args.device}/{args.compute_type}) ...")
             model = load_model(args.model, args.device, args.compute_type)
+            if diarize_idx is not None:
+                token = args.hf_token or os.environ.get("HF_TOKEN")
+                _log(args.quiet, f"loading diarization model '{args.diarize_model}' ...")
+                pipeline = diarize.load_pipeline(args.diarize_model, hf_token=token,
+                                                 num_threads=None)
         elif args.diarize:
             # Load + authenticate up front so a bad token fails before any slow ASR.
             token = args.hf_token or os.environ.get("HF_TOKEN")
             _log(args.quiet, f"loading diarization model '{args.diarize_model}' ...")
             pipeline = diarize.load_pipeline(args.diarize_model, hf_token=token, num_threads=None)
+
+        args.voice_ctx = None
+        if pipeline is not None and args.voiceprints is not None:
+            token = args.hf_token or os.environ.get("HF_TOKEN")
+            _log(args.quiet, f"loading voiceprint store '{args.voiceprints}' ...")
+            store = voiceprint.VoiceprintStore.load(args.voiceprints)
+            if not store.people:
+                _log(args.quiet, "    note: store is empty -- all speakers will stay "
+                                 "generic 'Speaker N' (see voiceprint.py enroll)")
+            embedder = voiceprint.load_embedder(hf_token=token)
+            args.voice_ctx = (embedder, store, args.voice_threshold)
 
         punctuator = None
         if not args.no_punctuate and punctuate.available():
@@ -399,6 +548,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.hotwords_resolved:
             n = args.hotwords_resolved.count(",") + 1
             _log(args.quiet, f"biasing recognition with {n} hotwords (front-loaded)")
+
+        if diarize_idx is not None:
+            return _transcribe_hybrid(args.inputs, diarize_idx, track_speakers, args, fmts,
+                                      model, pipeline, punctuator)
 
         if track_speakers is not None:
             return _transcribe_merged_files(args.inputs, track_speakers, args, fmts,
@@ -415,6 +568,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
     except diarize.DiarizationError as e:
+        print(f"\nerror: {e}", file=sys.stderr)
+        return 3
+    except voiceprint.VoiceprintError as e:
         print(f"\nerror: {e}", file=sys.stderr)
         return 3
     except KeyboardInterrupt:
