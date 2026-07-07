@@ -29,9 +29,18 @@ readable = [
 llm = [
     "anthropic>=0.69",
 ]
+# Terminal UI (video_transcribe.tui) that exposes every command + option as a
+# configurable, runnable, monitorable form. Textual for the UI, psutil to kill
+# the whole ffmpeg/torch process tree on stop.
+# Install with:  uv sync --extra tui
+tui = [
+    "textual>=0.85",
+    "psutil>=5.9",
+]
 
 [project.scripts]
 video-transcribe = "video_transcribe.cli:main"
+video-transcribe-tui = "video_transcribe.tui:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -19,8 +19,11 @@ SRT/VTT/JSON).
 ```pwsh
 uv sync                                   # transcription only
 uv sync --extra diarize --extra readable  # + speaker labels + punctuation (full)
+uv sync --extra tui                        # + the terminal UI (see below)
 ```
 
+- `tui` pulls in Textual + psutil (tiny); adds a terminal UI that lists every
+  command and option — configure, run, and monitor jobs without memorizing flags.
 - `diarize` pulls in torch + pyannote (~2–3 GB); needed for `--diarize`.
 - `readable` pulls in `punctuators` (tiny — reuses the onnxruntime faster-whisper
   already installs); enables sentence/punctuation restoration. On by default when
@@ -28,6 +31,35 @@ uv sync --extra diarize --extra readable  # + speaker labels + punctuation (full
 - `llm` pulls in the `anthropic` SDK; needed for the optional
   `llm_correct.py` correction pass (sends transcript text to the Claude API —
   see below). Not needed for anything else in this tool.
+
+## Terminal UI
+
+If you'd rather not memorize flags, the TUI puts every command and option in one
+place — pick a task, fill in the form, watch the exact command build live, then
+run and monitor it (several at once, if you like):
+
+```pwsh
+uv sync --extra tui          # one-time
+uv run video-transcribe-tui  # launch
+```
+
+- **Left:** every task, grouped and ordered by how often you'd run them —
+  Transcribe · Transcribe + diarize · List audio tracks · by-track modes ·
+  Correct (glossary / LLM) · Voiceprints (list / enroll / validate) · Mux ·
+  Environment doctor. Type to fuzzy-filter.
+- **Right:** one widget per CLI option (files, dropdowns, switches), a live
+  `$ python -m video_transcribe …` preview of the command, and **Run** / **Stop**.
+- **Bottom:** a live progress line (Whisper/pyannote/download bars animate in
+  place) over a full, colour-highlighted scrollback log. `w` saves the log,
+  `y` copies it, `c` clears it.
+
+New here? Run the **Environment doctor** task first — it checks ffmpeg, the
+optional extras, and the diarization / LLM tokens, and tells you exactly what to
+install if something's missing (also available standalone:
+`uv run python -m video_transcribe.tui_doctor`).
+
+Every task in the TUI maps 1:1 to the CLI below — it just builds the same
+command for you, so anything here is still scriptable by hand.
 
 ## Usage
 
@@ -278,7 +310,13 @@ src/video_transcribe/
   mux.py          # merge video + separate mic -> one MKV (Mix/Desktop/Mic)
   formats.py      # readable txt + srt / vtt / json writers
   cli.py          # argument parsing + orchestration (diarize / tracks / mux)
+  tui.py          # Textual terminal UI (video-transcribe-tui)
+  tui_catalog.py  # data-only task/option catalog -> subprocess argv (no UI deps)
+  tui_stream.py   # split subprocess output into live progress vs scrollback log
+  tui_highlight.py# Rich log highlighter tuned to this tool's output
+  tui_doctor.py   # environment/setup checks (also `python -m ...tui_doctor`)
 tests/
   smoke.py        # model-free merge/format checks
   real_check.py   # faster-whisper word-timestamps -> merge (no HF token)
+  tui_check.py    # catalog argv-building, stream demux, doctor, Textual pilot
 ```
