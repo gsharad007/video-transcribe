@@ -110,6 +110,26 @@ def has_video(media: Path) -> bool:
     return proc.returncode == 0 and bool(proc.stdout.strip())
 
 
+MUX_CONTAINER = ".mkv"
+
+
+def muxed_output_path(video: Path, out_dir: Path | None = None) -> Path:
+    """Default path for a muxed video+mic file (always an MKV).
+
+    The ``.with-mic`` suffix only exists to avoid clobbering the source, so it
+    is added *only* when the source video is itself an MKV. When the source has
+    a different extension (e.g. ``.mp4``), the ``.mkv`` output extension already
+    distinguishes it, so the suffix is omitted -> ``meeting.mkv``.
+    """
+    stem = video.stem
+    if video.suffix.lower() == MUX_CONTAINER:
+        name = stem + ".with-mic" + MUX_CONTAINER
+    else:
+        name = stem + MUX_CONTAINER
+    parent = out_dir if out_dir is not None else video.parent
+    return parent / name
+
+
 def mux_tracks(video: Path, mic: Path, dest: Path, *, mix_bitrate: str = "256k") -> Path:
     """Combine a video (with its desktop audio) + a separate mic file into one MKV.
 

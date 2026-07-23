@@ -77,6 +77,26 @@ def test_voice_names_override():
     print("[ok] merge: voiceprint-matched labels override generic 'Speaker N'")
 
 
+def test_muxed_output_path():
+    from pathlib import PurePosixPath
+
+    from video_transcribe import audio
+
+    # mp4 source -> .mkv output already differs, so no ".with-mic" suffix
+    p = audio.muxed_output_path(PurePosixPath("/x/meeting.mp4"))
+    assert p == PurePosixPath("/x/meeting.mkv"), p
+    # mkv source -> same extension as output, so keep ".with-mic" to avoid clobber
+    p = audio.muxed_output_path(PurePosixPath("/x/meeting.mkv"))
+    assert p == PurePosixPath("/x/meeting.with-mic.mkv"), p
+    # extension check is case-insensitive
+    p = audio.muxed_output_path(PurePosixPath("/x/meeting.MKV"))
+    assert p == PurePosixPath("/x/meeting.with-mic.mkv"), p
+    # out_dir override lands the file elsewhere
+    p = audio.muxed_output_path(PurePosixPath("/x/meeting.mp4"), PurePosixPath("/out"))
+    assert p == PurePosixPath("/out/meeting.mkv"), p
+    print("[ok] mux: output name drops '.with-mic' unless source is already .mkv")
+
+
 def test_hybrid_diarize_plus_track():
     # Group track (diarized, 2 speakers) + a separate fixed-speaker mic track,
     # merged by timestamp -- e.g. a meeting recording + your own mic.
@@ -311,6 +331,7 @@ if __name__ == "__main__":
     test_diarized()
     test_no_diarize()
     test_voice_names_override()
+    test_muxed_output_path()
     test_hybrid_diarize_plus_track()
     test_llm_correct()
     test_llm_correct_batches()

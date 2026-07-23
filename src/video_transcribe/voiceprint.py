@@ -398,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return 1
         n_correct = len(results["correct"])
+        n_wrong = len(results["wrong"])
         for row in results["wrong"]:
             print(f"  WRONG true={row['speaker']:<8} matched={row['matched']:<8} "
                   f"score={row['score']} [{row['start']:.0f}s] {row['text']}")
@@ -405,7 +406,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  MISS  true={row['speaker']:<8} (below threshold, score={row['score']}) "
                   f"[{row['start']:.0f}s] {row['text']}")
         print(f"{n_correct}/{total} correct ({n_correct / total * 100:.0f}%)")
-        return 0 if n_correct == total else 1
+        # Exit 0 iff there are zero WRONG matches -- a miss is harmless (the
+        # utterance just isn't enrolled), but a wrong match teaches the store
+        # a lie. Callers automating "validate, then enroll if it passed"
+        # should gate on this exit code, not on 100% (misses are routine on
+        # short utterances and don't make enrollment unsafe).
+        return 0 if n_wrong == 0 else 2
 
     # enroll
     store = VoiceprintStore.load(args.store)

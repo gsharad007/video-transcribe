@@ -376,7 +376,7 @@ def _maybe_mux(inputs: list[Path], out_dir: Path, quiet: bool) -> None:
     videos = [i for i, v in zip(inputs, flags) if v]
     mics = [i for i, v in zip(inputs, flags) if not v]
     if len(videos) == 1 and len(mics) == 1:
-        mkv = out_dir / (videos[0].stem + ".with-mic.mkv")
+        mkv = audio.muxed_output_path(videos[0], out_dir)
         _log(quiet, f"    muxing video + mic -> {mkv.name} (copies the video) ...")
         audio.mux_tracks(videos[0], mics[0], mkv)
         _log(quiet, f"    wrote {mkv}")

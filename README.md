@@ -167,10 +167,12 @@ beside the originals (titles are the generic `Mix` / `Desktop` / `Mic`):
 uv run video-transcribe meeting.mp4 meeting.m4a --track-speakers "Mar,Sharad" --mux
 
 # just merge, no transcript:
-uv run python -m video_transcribe.mux meeting.mp4 meeting.m4a   # -> meeting.with-mic.mkv
+uv run python -m video_transcribe.mux meeting.mp4 meeting.m4a   # -> meeting.mkv
 ```
 
 The video is stream-copied (no re-encode); only the small Mix track is encoded.
+The output is `<video>.mkv`; when the source is *itself* an `.mkv` the tool
+falls back to `<video>.with-mic.mkv` so it can't clobber the original.
 
 ## Voiceprints (optional, auto-identify diarized speakers by voice)
 
@@ -193,12 +195,12 @@ actually came from:
 uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.mp4 \
   --store voiceprints.json
 
-# from a hybrid video+mic transcript, restrict to the names that actually live
+# from a muxed video+mic file, restrict to the names that actually live
 # in *that* file (--list-tracks on the main CLI shows track indices):
-uv run video-transcribe meeting.with-mic.mkv --list-tracks
-uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.with-mic.mkv \
+uv run video-transcribe meeting.mkv --list-tracks
+uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.mkv \
   --store voiceprints.json --names "Ryan,Mar,Ness,John" --track 1   # Desktop
-uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.with-mic.mkv \
+uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.mkv \
   --store voiceprints.json --names "Sharad" --track 2               # Mic
 
 uv run python -m video_transcribe.voiceprint list --store voiceprints.json
@@ -228,6 +230,12 @@ transcript whose names you've already confirmed, and
 uv run python -m video_transcribe.voiceprint validate meeting.json meeting.mp4 --store voiceprints.json
 ```
 
+`validate`'s exit code is meant for scripting a validate-then-enroll pipeline:
+`0` = no wrong matches (safe to enroll; misses don't count against this),
+`1` = no speaker in this transcript is in the store yet (nothing to compare —
+also safe to enroll, it's just a new person), `2` = at least one wrong match
+(don't enroll from this recording without reviewing it first).
+
 This is **self-learning** by habit, not automatically: every time you confirm
 a `correct.py` mapping is right, enroll that transcript too, and accuracy
 compounds the more the tool is used.
@@ -236,6 +244,51 @@ The store is just a JSON file of embedding vectors per name — small, but it
 *is* biometric-ish data about named real people, so keep it out of version
 control and anywhere you wouldn't put a phone book with voice tags (a location
 outside any git repo works well).
+
+## Full workflow, start to finish
+
+Putting the pieces above together — this is the whole recurring loop as one
+sequence, for a 1-1 recorded as video (the other person) + separate mic (you):
+
+```pwsh
+# 1. transcribe both tracks (exact speakers, no diarization) + mux into one .mkv
+uv run video-transcribe meeting.mp4 meeting.m4a --track-speakers "Mar,Sharad" `
+  --hotwords-file glossary.json --mux -f txt -f srt -f json
+
+# 2. glossary term corrections (speakers are already exact from step 1, so no --speakers)
+uv run python -m video_transcribe.correct meeting.json --glossary glossary.json -f txt -f srt -f json
+
+# 3. before teaching the store anything, check it still recognizes both voices here
+uv run python -m video_transcribe.voiceprint validate meeting.json meeting.mp4 --store voiceprints.json --names "Mar"
+uv run python -m video_transcribe.voiceprint validate meeting.json meeting.m4a --store voiceprints.json --names "Sharad"
+
+# 4. exit code 0 or 1 from step 3 (not 2) -> safe to enroll
+uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.mp4 --store voiceprints.json --names "Mar"
+uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.m4a --store voiceprints.json --names "Sharad"
+```
+
+For a **group call** (one video mixing several people + your separate mic),
+swap step 1 for the hybrid `--diarize-track` form and skip straight to
+`--voiceprints` for auto-naming — but treat step 4 as a manual, reviewed step
+rather than something to run unconditionally, since an auto-assigned name can
+still be wrong even when the diarizer itself is confident:
+
+```pwsh
+# 1. diarize the video (N people) + auto-name by voice + fixed mic name + mux
+uv run video-transcribe meeting.mp4 meeting.m4a --diarize-track 0 --speakers 4 \
+  --track-speakers "Sharad" --voiceprints voiceprints.json \
+  --hotwords-file glossary.json --mux -f txt -f srt -f json
+
+# 2. glossary corrections (same as above)
+uv run python -m video_transcribe.correct meeting.json --glossary glossary.json -f txt -f srt -f json
+
+# 3. READ the transcript; confirm every auto-assigned name against what was actually said.
+#    If anyone stayed generic ("Speaker N"), rename with correct.py --speakers "Speaker 1=Name,..."
+
+# 4. only after confirming names by hand, enroll each one (mic name from meeting.m4a, rest from meeting.mp4)
+uv run python -m video_transcribe.voiceprint validate meeting.json meeting.mp4 --store voiceprints.json --names "Ryan,Mar,Ness,John"
+uv run python -m video_transcribe.voiceprint enroll   meeting.json meeting.mp4 --store voiceprints.json --names "Ryan,Mar,Ness,John"
+```
 
 ## LLM-assisted correction (optional, sends text to Claude)
 

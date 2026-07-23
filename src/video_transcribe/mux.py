@@ -25,10 +25,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("video", type=Path, help="video file (with desktop/system audio)")
     p.add_argument("mic", type=Path, help="separate microphone audio file")
     p.add_argument("-o", "--output", type=Path, default=None,
-                   help="output .mkv (default: <video>.with-mic.mkv)")
+                   help="output .mkv (default: <video>.mkv, or <video>.with-mic.mkv "
+                        "when the source is itself an .mkv)")
     args = p.parse_args(argv)
 
-    out = args.output or args.video.with_name(args.video.stem + ".with-mic.mkv")
+    out = args.output or audio.muxed_output_path(args.video)
     try:
         audio.mux_tracks(args.video, args.mic, out)
     except (audio.FFmpegNotFound, RuntimeError) as e:
