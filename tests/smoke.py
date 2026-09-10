@@ -6,9 +6,14 @@ Run: uv run python tests/smoke.py
 from __future__ import annotations
 
 from video_transcribe import formats, merge
+from video_transcribe.correct import correct_conversation, resolve_speaker_at, resolve_speaker_map
 from video_transcribe.diarize import SpeakerTurn
 from video_transcribe.llm_correct import correct_texts_with_llm, diff_report
 from video_transcribe.transcribe import Segment, TranscriptionResult, Word
+from video_transcribe.visual_id import (
+    VisualReading, auto_name_from_visual, check_label_consistency, detect_border,
+    fuzzy_match, label_crop_box, sample_points, vote_readings,
+)
 
 
 def _w(t: str, s: float, e: float) -> Word:
@@ -59,6 +64,55 @@ def test_no_diarize():
     joined = " ".join(u.text for u in conv.utterances)
     assert "you" not in joined.lower().split()
     print("[ok] no-diarize merge: pause grouping + cleaning")
+
+
+def test_resolve_speaker_map_explicit_empty_suppresses_default():
+    # A meeting whose glossary default speaker_map is for a DIFFERENT recurring
+    # meeting (e.g. "Speaker 1": "Mar" from an old 1-1 convention) must not
+    # silently apply to some other meeting's unresolved "Speaker 1". Omitting
+    # --speakers uses the default (the common, intended case); explicitly
+    # passing "" must suppress it entirely -- this is the exact bug that
+    # mislabeled an unrelated person as "Mar" in a group meeting transcript.
+    glossary = {"speaker_map": {"Speaker 1": "Mar", "Speaker 2": "Sharad"}}
+
+    assert resolve_speaker_map(glossary, None) == {"Speaker 1": "Mar", "Speaker 2": "Sharad"}
+    assert resolve_speaker_map(glossary, "") == {}
+    assert resolve_speaker_map(glossary, "Speaker 1=Ryan") == {"Speaker 1": "Ryan"}
+    print("[ok] correct: --speakers '' suppresses the glossary default instead of using it")
+
+
+def test_speaker_at_splits_one_utterance_out_of_a_label():
+    # The exact real-world shape this exists for: a diarized label ("Amanda")
+    # whose visual-id readings flagged one short utterance as actually a
+    # different person -- --speaker-at applies a human's decision about that
+    # ONE utterance without touching any other utterance under that label.
+    utterances = [
+        {"start": 37.3, "end": 39.18, "speaker": "Amanda", "text": "Chris, I think your mic is off."},
+        {"start": 117.38, "end": 128.24, "speaker": "Amanda", "text": "Congrats JB."},
+    ]
+    ranges = resolve_speaker_at(utterances, ["37.3=Sharad"])
+    assert ranges == [(37.3, 39.18, "Sharad")]
+
+    data = {
+        "utterances": utterances,
+        "segments": [
+            {"id": 0, "start": 37.3, "end": 39.18, "speaker": "Amanda", "text": "Chris, I think your mic is off."},
+            {"id": 1, "start": 117.38, "end": 128.24, "speaker": "Amanda", "text": "Congrats JB."},
+        ],
+        "speakers": ["Amanda"],
+    }
+    conv, _meta = correct_conversation(data, {}, [], speaker_at=ranges)
+    assert [u.speaker for u in conv.utterances] == ["Sharad", "Amanda"]
+    assert [s.speaker for s in conv.segments] == ["Sharad", "Amanda"]
+    assert set(conv.speakers) == {"Sharad", "Amanda"}
+
+    try:
+        resolve_speaker_at(utterances, ["99.0=Nobody"])
+        assert False, "expected a SystemExit for an unmatched start time"
+    except SystemExit:
+        pass
+    print("[ok] correct: --speaker-at splits one utterance out of a label without "
+          "touching the rest")
 
 
 def test_voice_names_override():
@@ -306,6 +360,169 @@ def test_voiceprint_exclusive_assignment():
     print("[ok] voiceprint: exclusive one-to-one assignment beats the attractor")
 
 
+def _draw_border(shape, bbox, color, thickness=4):
+    """Synthetic frame with a stroke rectangle border, for detect_border tests."""
+    import numpy as np
+    frame = np.full(shape, 30, dtype=np.uint8)
+    top, left, bottom, right = bbox
+    t = thickness
+    frame[top:top + t, left:right] = color
+    frame[bottom - t:bottom, left:right] = color
+    frame[top:bottom, left:left + t] = color
+    frame[top:bottom, right - t:right] = color
+    return frame
+
+
+def test_detect_border():
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        print("[skip] detect_border: numpy not installed (uv sync --extra visual)")
+        return
+
+    # Border color/geometry measured from the real incident recording (see
+    # visual_id.py's module docstring) -- NOT a vivid/saturated blue guess.
+    # Using the real measured values here is what caught two real bugs during
+    # development (a band width that scaled with tile size, and an
+    # area-fraction floor sized for a filled region instead of a thin stroke)
+    # that a purely synthetic "nice round numbers" test would have missed.
+    frame = _draw_border((300, 300, 3), (40, 40, 260, 260), (166, 197, 247), thickness=4)
+    det = detect_border(frame)
+    assert det is not None, "should detect a real-shaped border"
+    assert abs(det.bbox[0] - 40) <= 2 and abs(det.bbox[1] - 40) <= 2
+
+    import numpy as np
+    blank_frame = np.full((300, 300, 3), 30, dtype=np.uint8)
+    assert detect_border(blank_frame) is None, "must not hallucinate a border from nothing"
+
+    # A solid filled square (not a stroke) must be rejected even though it's
+    # the same color -- this is the interior/perimeter shape check's whole job.
+    filled = np.full((300, 300, 3), 30, dtype=np.uint8)
+    filled[40:260, 40:260] = (166, 197, 247)
+    assert detect_border(filled) is None, "a filled blob must not be mistaken for a stroke"
+    print("[ok] visual_id: detect_border finds a real stroke, rejects blank/filled frames")
+
+
+def test_fuzzy_match():
+    # OCR reads a full name ("Sharad Gupta"); this project's roster convention
+    # is first names only ("Sharad") -- whole-string difflib ratio alone
+    # under-scores this real case (0.56, below any reasonable threshold) because
+    # of the length mismatch from the surname. This was a real bug found by
+    # testing against actual OCR output, not a hypothetical.
+    assert fuzzy_match("Shared Gupta", ["Sharad", "Mar", "John"])[0] == "Sharad"
+    assert fuzzy_match("Sharad Gupta", ["Sharad", "Mar", "John"]) == ("Sharad", 1.0)
+    assert fuzzy_match("Amanda Diaz", ["Sharad", "Amanda", "John"])[0] == "Amanda"
+    # no roster match at all -> reject, don't guess
+    assert fuzzy_match("xyz123", ["Sharad", "Mar"]) == (None, 0.0)
+    assert fuzzy_match("", ["Sharad"]) == (None, 0.0)
+    assert fuzzy_match("Sharad", []) == (None, 0.0)
+    print("[ok] visual_id: fuzzy_match handles first-name-vs-full-name OCR text")
+
+
+def test_vote_readings():
+    unanimous = vote_readings(["Mar", "Mar", "Mar"], utterance_start=0, utterance_end=5, label="Speaker 1")
+    assert unanimous.name == "Mar" and unanimous.confidence == 1.0 and unanimous.coverage == 1.0
+
+    tie = vote_readings(["Mar", "John", None], utterance_start=0, utterance_end=5, label="X")
+    assert tie.name is None and tie.reject_reason == "ambiguous_vote"
+
+    all_rejected = vote_readings([None, None, None], utterance_start=0, utterance_end=5, label="X")
+    assert all_rejected.name is None and all_rejected.reject_reason == "no_border"
+
+    too_short = vote_readings([], utterance_start=0, utterance_end=5, label="X")
+    assert too_short.reject_reason == "insufficient_duration"
+    print("[ok] visual_id: vote_readings (unanimous / tie / all-rejected / too-short)")
+
+
+def test_sample_points():
+    pts = sample_points(0, 20, spacing=2.0)
+    assert 3 <= len(pts) <= 8
+    assert all(0.3 <= p <= 19.7 for p in pts)
+    assert sample_points(0, 0.4) == []  # too short even for the margin
+    print("[ok] visual_id: sample_points spacing/margin/bounds")
+
+
+def test_label_crop_box():
+    box = label_crop_box((100, 100, 500, 500))  # left, top, right, bottom
+    left, top, right, bottom = box
+    assert left == 100 and right < 500 and top > 100 and bottom < 500
+    print("[ok] visual_id: label_crop_box stays inside the tile bbox")
+
+
+def _vreading(label, name, start, *, conf=1.0, n_accepted=3):
+    return VisualReading(
+        utterance_start=start, utterance_end=start + 3, label=label, name=name,
+        confidence=conf, coverage=1.0, n_samples=3, n_accepted=n_accepted, reject_reason=None,
+    )
+
+
+def test_check_label_consistency():
+    # Reproduces the actual 2026-08-12 incident's shape: a diarized label
+    # ("Speaker 1") whose visual readings resolve to two different real
+    # people -- one contributing exactly ONE utterance (the real minority
+    # speaker had exactly one too). This is the single most important test
+    # in this module.
+    incident = [_vreading("Speaker 1", "Sharad", 0)]
+    incident += [_vreading("Speaker 1", "Amanda", 10 + i * 10) for i in range(8)]
+    incident += [_vreading("John", "John", 5)]
+    flagged = check_label_consistency(incident)
+    assert len(flagged) == 1 and flagged[0].label == "Speaker 1"
+    assert set(flagged[0].names) == {"Sharad", "Amanda"}
+
+    clean = [_vreading("Speaker 2", "Mar", i * 5) for i in range(5)]
+    assert check_label_consistency(clean) == []
+
+    # A single LOW-confidence misread on an otherwise-consistent label must
+    # not manufacture a false alarm.
+    low_conf = [_vreading("Speaker 3", "Ryan", i * 5) for i in range(9)]
+    low_conf += [_vreading("Speaker 3", "Ness", 99, conf=0.4)]
+    assert check_label_consistency(low_conf) == []
+
+    # But a single HIGH-confidence, well-sampled one-off utterance for a 2nd
+    # person SHOULD flag -- that's the whole point (see `incident` above).
+    high_conf = [_vreading("Speaker 4", "Ryan", i * 5) for i in range(9)]
+    high_conf += [_vreading("Speaker 4", "Ness", 99, conf=1.0)]
+    assert len(check_label_consistency(high_conf)) == 1
+
+    # The real false-alarm shape found during development: high "confidence"
+    # (1 vote / 1 accepted sample = trivially 1.0) but only 1 accepted sample
+    # out of many attempted -- a stray misdetected frame, not real evidence.
+    # Every false merge_suspected flag hit while testing against real video
+    # had exactly this shape; requiring >=2 agreeing samples fixes it.
+    sparse_fluke = [_vreading("John", "John", i * 10, n_accepted=1) for i in range(2)]
+    sparse_fluke += [_vreading("John", "Sharad", 99, conf=1.0, n_accepted=1)]
+    assert check_label_consistency(sparse_fluke) == []
+
+    # Two isolated single-sample flukes for the SAME wrong name, in two
+    # DIFFERENT utterances, must not clear the count path just by reaching
+    # raw utterance-count 2 -- each must individually be well-sampled.
+    two_weak_utterances = [_vreading("Speaker 5", "Ryan", i * 10, n_accepted=1) for i in range(9)]
+    two_weak_utterances += [
+        _vreading("Speaker 5", "Ness", 90, n_accepted=1),
+        _vreading("Speaker 5", "Ness", 95, n_accepted=1),
+    ]
+    assert check_label_consistency(two_weak_utterances) == []
+    print("[ok] visual_id: check_label_consistency reproduces the real incident, "
+          "rejects low-confidence and sparse-sample false alarms")
+
+
+def test_auto_name_from_visual_never_renames_resolved_label():
+    # A label already resolved (by voiceprint match or --track-speakers
+    # ground truth) must NEVER be renamed by a visual-id guess, even a
+    # clean unambiguous one -- only still-generic "Speaker N" labels are
+    # fair game. This is the direct fix for the miscategorization the whole
+    # feature exists to prevent.
+    readings = [
+        VisualReading(0, 3, "Mar", "SomeoneElse", 1.0, 1.0, 3, 3, None),
+        VisualReading(10, 13, "Mar", "SomeoneElse", 1.0, 1.0, 3, 3, None),
+        VisualReading(20, 23, "Speaker 1", "John", 1.0, 1.0, 3, 3, None),
+    ]
+    names = auto_name_from_visual(readings)
+    assert "Mar" not in names
+    assert names == {"Speaker 1": "John"}
+    print("[ok] visual_id: auto_name_from_visual only renames still-generic labels")
+
+
 def test_formats():
     conv = merge.build_conversation(make_segments(), TURNS, tidy=True)
     meta = formats.Meta.from_result("clip.mp4", RESULT, diarized=True)
@@ -330,6 +547,8 @@ def test_formats():
 if __name__ == "__main__":
     test_diarized()
     test_no_diarize()
+    test_resolve_speaker_map_explicit_empty_suppresses_default()
+    test_speaker_at_splits_one_utterance_out_of_a_label()
     test_voice_names_override()
     test_muxed_output_path()
     test_hybrid_diarize_plus_track()
@@ -339,5 +558,12 @@ if __name__ == "__main__":
     test_llm_correct_dropped_index()
     test_voiceprint_store()
     test_voiceprint_exclusive_assignment()
+    test_detect_border()
+    test_fuzzy_match()
+    test_vote_readings()
+    test_sample_points()
+    test_label_crop_box()
+    test_check_label_consistency()
+    test_auto_name_from_visual_never_renames_resolved_label()
     test_formats()
     print("\nALL SMOKE CHECKS PASSED")

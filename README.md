@@ -20,6 +20,7 @@ SRT/VTT/JSON).
 uv sync                                   # transcription only
 uv sync --extra diarize --extra readable  # + speaker labels + punctuation (full)
 uv sync --extra tui                        # + the terminal UI (see below)
+uv sync --extra visual                     # + visual speaker ID (see below)
 ```
 
 - `tui` pulls in Textual + psutil (tiny); adds a terminal UI that lists every
@@ -31,6 +32,9 @@ uv sync --extra tui                        # + the terminal UI (see below)
 - `llm` pulls in the `anthropic` SDK; needed for the optional
   `llm_correct.py` correction pass (sends transcript text to the Claude API —
   see below). Not needed for anything else in this tool.
+- `visual` pulls in EasyOCR (PyTorch-backed, ~150 MB + a one-time local model
+  download); needed for `--visual-id` / `voiceprint.py`'s sibling tool
+  `visual_id.py` (see below). Fully local after that first download.
 
 ## Terminal UI
 
@@ -245,6 +249,87 @@ The store is just a JSON file of embedding vectors per name — small, but it
 control and anywhere you wouldn't put a phone book with voice tags (a location
 outside any git repo works well).
 
+## Visual speaker ID (optional, for Google Meet gallery-view recordings)
+
+Audio diarization can silently **merge two different real speakers into one
+cluster** when their utterances are short or acoustically similar — this
+happened for real: a diarized "Speaker 1" cluster spanning a whole meeting
+turned out to contain two different people, undetected until a human caught
+it by ear. Google Meet's own UI gives an independent signal for this: each
+participant tile has a name label, and whoever's talking gets a colored
+border around their tile. `visual_id.py` samples video frames per utterance,
+finds the bordered tile, OCRs its name, and uses that to:
+
+1. auto-name any diarized speaker still generic (`Speaker N`) after
+   diarization/voiceprints, and
+2. **detect when one diarized label's utterances visually resolve to more
+   than one distinct person** — the exact failure mode above. This is only
+   ever *reported*, never auto-fixed: a miss is harmless (the label just
+   stays as it would without this feature), but a wrong silent guess is
+   exactly what this exists to prevent, so a flagged (`merge_suspected`)
+   label is never auto-named, even partially.
+
+```pwsh
+uv sync --extra visual   # one-time: EasyOCR + a local model download
+
+# read-only: sample frames, OCR, report -- never writes a corrected transcript
+uv run python -m video_transcribe.visual_id detect meeting.json meeting.mp4 \
+  --roster "Ryan,Mar,Ness,John" [--voiceprints voiceprints.json]
+  # -> meeting.visual.json; exit 0 = clean, 1 = nothing useful found
+  #    (no gallery view visible / no roster), 2 = merge_suspected -- review before enrolling
+```
+
+**As part of the main transcribe command** — `--visual-id` composes with
+`--diarize` / `--diarize-track` exactly like `--voiceprints` does (same
+`voice_names` mechanism under the hood), and writes `<output>.visual.json`
+alongside the transcript:
+
+```pwsh
+# plain diarize + visual auto-naming
+uv run video-transcribe meeting.mp4 --diarize --speakers 4 \
+  --visual-id --visual-roster "Ryan,Mar,Ness,John"
+
+# layered with voiceprints -- voiceprint match runs first; visual-id then (a)
+# names any label voiceprints left generic, and (b) STILL runs the
+# merge-consistency check on every diarized label, even ones voiceprints
+# already named (a confident voice match confirms *a* voice matched a cluster,
+# not that the cluster wasn't itself a merge of two similar-sounding voices)
+uv run video-transcribe meeting.mp4 --diarize --speakers 4 \
+  --voiceprints voiceprints.json --visual-id --visual-roster "Ryan,Mar,Ness,John"
+
+# group call + separate mic (hybrid) -- same composition, applies to the
+# diarized video track only (the mic's fixed name is already exact)
+uv run video-transcribe meeting.mp4 meeting.m4a --diarize-track 0 --speakers 4 \
+  --track-speakers "Sharad" --voiceprints voiceprints.json \
+  --visual-id --visual-roster "Ryan,Mar,Ness,John" --mux
+
+# --track-speakers / --tracks alone (no diarization) -- --visual-id is a
+# no-op with a note: every speaker is already exact, nothing to check
+uv run video-transcribe meeting.mp4 meeting.m4a --track-speakers "Mar,Sharad" --visual-id
+# -> note: --visual-id is ignored in track mode (nothing to corroborate)
+
+# no diarization requested at all -- hard error rather than a silent no-op,
+# since there ARE no speaker labels to corroborate here
+uv run video-transcribe meeting.mp4 --visual-id --visual-roster "Ryan"
+# -> error: --visual-id has no diarized speaker labels to corroborate; ...
+```
+
+If a label comes back `merge_suspected`, it's **never** auto-named — read the
+`.visual.json` report, rename by hand (`correct.py --speakers`), and
+re-validate/enroll voiceprints for whichever names turn out to be right, same
+as reviewing any other ambiguous diarization result.
+
+Border color/geometry and the merge-detection thresholds were measured
+against a real recording, not guessed from Meet's brand colors — the
+on-screen border renders far less saturated than a "vivid blue" assumption
+would predict, and a naive largest-matching-region heuristic locks onto
+generic background/lighting content instead of the real border. See
+`visual_id.py`'s module and `detect_border`/`check_label_consistency`
+docstrings for the specific real failure modes this was tuned against.
+Known limitation: a genuine minority speaker whose only contribution is a
+very short utterance may not get enough sampled frames to be caught — a safe
+miss, not a wrong guess, but worth knowing about.
+
 ## Full workflow, start to finish
 
 Putting the pieces above together — this is the whole recurring loop as one
@@ -269,7 +354,8 @@ uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.m4a --s
 
 For a **group call** (one video mixing several people + your separate mic),
 swap step 1 for the hybrid `--diarize-track` form and skip straight to
-`--voiceprints` for auto-naming — but treat step 4 as a manual, reviewed step
+`--voiceprints` for auto-naming (optionally layer `--visual-id` alongside it —
+see Visual speaker ID above) — but treat step 4 as a manual, reviewed step
 rather than something to run unconditionally, since an auto-assigned name can
 still be wrong even when the diarizer itself is confident:
 

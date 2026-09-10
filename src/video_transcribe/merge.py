@@ -22,6 +22,13 @@ from typing import Callable
 from video_transcribe.diarize import SpeakerTurn
 from video_transcribe.transcribe import Segment, TranscriptionResult
 
+# The generic label a still-unresolved diarized speaker gets (see
+# _friendly_names below): "Speaker 1", "Speaker 2", ... Exported so other
+# modules that need to tell "still generic" apart from "already resolved to
+# a real name" (visual_id.py's auto_name_from_visual/is_generic_label) share
+# this one convention instead of re-encoding the literal independently.
+GENERIC_SPEAKER_PREFIX = "Speaker "
+
 # Phrases Whisper habitually hallucinates over silence/music/applause. Compared
 # case-insensitively after stripping punctuation; only *whole-segment* matches
 # are dropped, so real sentences containing these words are untouched.
@@ -134,7 +141,7 @@ def _friendly_names(
             mapping[spk] = known[spk]
         else:
             n += 1
-            mapping[spk] = f"Speaker {n}"
+            mapping[spk] = f"{GENERIC_SPEAKER_PREFIX}{n}"
     return mapping
 
 

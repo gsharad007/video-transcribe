@@ -51,6 +51,17 @@ def load_model(model_size: str = "large-v3", device: str = "cpu", compute_type: 
     return WhisperModel(model_size, device=device, compute_type=compute_type)
 
 
+# faster-whisper's own repetition-loop defense (compression_ratio_threshold +
+# temperature fallback) isn't catching every case on this project's real
+# recordings -- found (2026-08-15) in transcripts going back to at least
+# 2026-07-28 (Sync4: "and then I'll call it done" repeated 17x), predating
+# any of this session's changes, so it's a longstanding gap, not a
+# regression. no_repeat_ngram_size hard-forbids the decoder from repeating
+# any 3-word sequence, which directly kills these loops regardless of
+# segment length or language setting.
+DEFAULT_NO_REPEAT_NGRAM_SIZE = 3
+
+
 def transcribe(
     audio_path: Path,
     *,
@@ -62,6 +73,7 @@ def transcribe(
     beam_size: int = 5,
     word_timestamps: bool = False,
     hotwords: str | None = None,
+    no_repeat_ngram_size: int = DEFAULT_NO_REPEAT_NGRAM_SIZE,
     model=None,
     progress: ProgressFn | None = None,
 ) -> TranscriptionResult:
@@ -81,6 +93,7 @@ def transcribe(
         beam_size=beam_size,
         word_timestamps=word_timestamps,
         hotwords=hotwords or None,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
 
     # faster-whisper returns `raw_segments` as a lazy generator; iterating it is

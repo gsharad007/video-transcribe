@@ -69,6 +69,25 @@ def extract_audio(media: Path, dest: Path, *, stream_index: int | None = None) -
     return dest
 
 
+def extract_frame(media: Path, timestamp: float, dest: Path) -> Path:
+    """Grab a single video frame at `timestamp` (seconds) as a PNG at `dest`.
+
+    Used by visual_id.py to sample gallery-view frames; kept here alongside
+    extract_audio since both are just "one ffmpeg decode" utilities.
+    """
+    ffmpeg = _require("ffmpeg")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [ffmpeg, "-y", "-ss", f"{max(0.0, timestamp):.3f}", "-i", str(media),
+           "-vframes", "1", str(dest)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not dest.exists():
+        raise RuntimeError(
+            f"ffmpeg failed to extract a frame from {media} at {timestamp:.2f}s:\n"
+            f"{proc.stderr.strip()}"
+        )
+    return dest
+
+
 def probe_streams(media: Path) -> list[dict]:
     """List audio streams: a_index (for -map 0:a:N), codec, channels, title, language."""
     ffprobe = _require("ffprobe")

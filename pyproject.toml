@@ -29,6 +29,18 @@ readable = [
 llm = [
     "anthropic>=0.69",
 ]
+# Visual speaker identification (video_transcribe.visual_id) for Google Meet
+# gallery-view recordings -- OCRs the active-speaker-highlighted tile's name
+# label to corroborate/auto-name diarized speakers and catch cluster-merge
+# errors audio diarization alone can't see. Fully local: no Tesseract system
+# binary available in this environment (no admin rights to install it), so
+# this uses EasyOCR (PyTorch-backed, one-time local model download on first
+# run, no per-call network access after that) instead.
+# Install with:  uv sync --extra visual
+visual = [
+    "easyocr>=1.7",
+    "pillow>=10.0",
+]
 # Terminal UI (video_transcribe.tui) that exposes every command + option as a
 # configurable, runnable, monitorable form. Textual for the UI, psutil to kill
 # the whole ffmpeg/torch process tree on stop.

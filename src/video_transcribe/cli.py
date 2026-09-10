@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-from video_transcribe import __version__, audio, diarize, formats, merge, punctuate, voiceprint
+from video_transcribe import __version__, audio, diarize, formats, merge, punctuate, visual_id, voiceprint
 from video_transcribe.transcribe import Segment, load_model, transcribe
 
 EXT = {"txt": ".txt", "srt": ".srt", "vtt": ".vtt", "json": ".json"}
@@ -125,6 +125,22 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Cosine-similarity threshold for a confident voice match "
                         f"(default: {voiceprint.DEFAULT_MATCH_THRESHOLD}).")
 
+    vi = p.add_argument_group("visual speaker identification (Google Meet gallery view)")
+    vi.add_argument("--visual-id", action="store_true",
+                    help="Corroborate/auto-name diarized speakers by OCR-reading the "
+                         "active-speaker-highlighted tile in a Google Meet gallery-view "
+                         "recording (needs the 'visual' extra). Runs alongside diarization "
+                         "only -- see voiceprint.py for the underlying tool if you want more "
+                         "control, e.g. reviewing a merge_suspected finding by hand.")
+    vi.add_argument("--visual-roster", default=None, metavar="NAMES",
+                    help="Comma-separated known participant names for visual matching. "
+                         "Combines with --voiceprints's enrolled names if both are given.")
+    vi.add_argument("--visual-report", type=Path, default=None,
+                    help="Write the visual-id detection report JSON here "
+                         "(default: <output>.visual.json next to the transcript).")
+    vi.add_argument("--visual-sample-spacing", type=float, default=visual_id.DEFAULT_SAMPLE_SPACING)
+    vi.add_argument("--visual-name-threshold", type=float, default=visual_id.DEFAULT_NAME_THRESHOLD)
+
     t = p.add_argument_group("multi-track input (e.g. ReLive 'Separate Microphone Track')")
     t.add_argument("--tracks", default=None, metavar="MAP",
                    help="Per-track speakers as IDX=NAME pairs, e.g. "
@@ -162,8 +178,92 @@ def _log(quiet: bool, msg: str) -> None:
         print(msg, file=sys.stderr)
 
 
+def _apply_visual_id(conv, media: Path, args: argparse.Namespace, out_dir: Path,
+                     out_stem: str, *, multi_input: bool = False) -> "merge.Conversation":
+    """Run visual_id against conv's utterances after diarization has already
+    resolved (or left generic) every speaker label. Auto-names any label
+    that's still generic with a clean, unambiguous, unflagged visual identity
+    -- the same shape as `voice_names`, applied the same way `--speaker`
+    already does above (dataclasses.replace over speakers/utterances/segments).
+
+    A `merge_suspected` label is NEVER auto-named, even partially, and always
+    gets a loud warning -- see visual_id.py's module docstring. This is the
+    main CLI's integration point for the safety feature the whole module was
+    built for; voiceprint.py's validate/enroll stay the tool of record for
+    reviewing a flagged label and deciding what to do about it by hand.
+    """
+    roster = [n.strip() for n in (args.visual_roster or "").split(",") if n.strip()]
+    if args.voiceprints and args.voiceprints.exists():
+        store = voiceprint.VoiceprintStore.load(args.voiceprints)
+        roster.extend(n for n in store.people if n not in roster)
+    if not roster:
+        print("warning: --visual-id given without --visual-roster or --voiceprints "
+              "(and the store has no enrolled names); nothing to name against, "
+              "skipping visual-id", file=sys.stderr)
+        return conv
+
+    transcript_dict = {"utterances": [
+        {"start": u.start, "end": u.end, "speaker": u.speaker} for u in conv.utterances
+    ]}
+    _log(args.quiet, "    running visual-id (OCR-reading the active-speaker tile, "
+                     "this samples several video frames per utterance) ...")
+    try:
+        readings = visual_id.identify_transcript(
+            media, transcript_dict, roster,
+            spacing=args.visual_sample_spacing, name_threshold=args.visual_name_threshold,
+        )
+    except visual_id.VisualIdError as e:
+        print(f"warning: visual-id failed, skipping: {e}", file=sys.stderr)
+        return conv
+
+    flagged = visual_id.check_label_consistency(readings)
+    flagged_labels = {f.label for f in flagged}
+    names = visual_id.auto_name_from_visual(readings, flagged_labels=flagged_labels)
+
+    report = visual_id.build_report(transcript_dict, media, readings, {
+        "sample_spacing": args.visual_sample_spacing,
+        "name_threshold": args.visual_name_threshold, "roster": roster,
+    })
+    if args.visual_report and multi_input:
+        # A user-given path is a single file; reusing it across multiple
+        # independently-transcribed inputs (see the loop in main()) would
+        # silently overwrite each earlier file's report with the next one's.
+        report_path = out_dir / (out_stem + ".visual.json")
+        _log(args.quiet, f"    note: --visual-report ignored for multi-file input "
+                         f"(would overwrite between files); using {report_path}")
+    else:
+        report_path = args.visual_report or (out_dir / (out_stem + ".visual.json"))
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    _log(args.quiet, f"    wrote {report_path}")
+
+    for f in flagged:
+        name_list = ", ".join(f"{n} ({d['utterances']} utt)" for n, d in f.names.items())
+        print(f"warning: visual-id suspects label {f.label!r} actually contains MULTIPLE "
+              f"people ({name_list}) -- NOT auto-naming it. Review {report_path} and "
+              f"rename by hand (correct.py --speakers), then re-enroll voiceprints for "
+              f"whichever names turn out right.", file=sys.stderr)
+
+    if names:
+        _log(args.quiet, f"    visual-id named: {', '.join(sorted(names.values()))}")
+
+        def rename(s: str | None) -> str | None:
+            return names.get(s, s) if s else s
+
+        conv = replace(
+            conv,
+            # dict.fromkeys, not a plain list comp: two DIFFERENT raw labels can
+            # rename to the SAME name (e.g. diarization fragmented one person
+            # into two clusters, and visual-id correctly named both) -- a plain
+            # list would carry the duplicate through into the speaker count.
+            speakers=list(dict.fromkeys(rename(s) for s in conv.speakers)),
+            utterances=[replace(u, speaker=rename(u.speaker)) for u in conv.utterances],
+            segments=[replace(s, speaker=rename(s.speaker)) for s in conv.segments],
+        )
+    return conv
+
+
 def _transcribe_one(inp: Path, args: argparse.Namespace, fmts: list[str],
-                    pipeline, punctuator) -> int:
+                    pipeline, punctuator, *, multi_input: bool = False) -> int:
     if not inp.exists():
         print(f"error: file not found: {inp}", file=sys.stderr)
         return 1
@@ -232,6 +332,8 @@ def _transcribe_one(inp: Path, args: argparse.Namespace, fmts: list[str],
             utterances=[replace(u, speaker=args.speaker) for u in conv.utterances],
             segments=[replace(s, speaker=args.speaker) for s in conv.segments],
         )
+    if args.visual_id and turns:
+        conv = _apply_visual_id(conv, inp, args, out_dir, inp.stem, multi_input=multi_input)
     meta = formats.Meta.from_result(inp.name, result,
                                     diarized=bool(turns) or bool(args.speaker))
 
@@ -467,6 +569,8 @@ def _transcribe_hybrid(inputs: list[Path], diarize_idx: int, names: list[str],
         print("    restoring punctuation ...", file=sys.stderr)
     conv = merge.build_conversation_from_tagged(tagged_tracks, tidy=not args.no_tidy,
                                                 punctuator=punctuator)
+    if args.visual_id and turns:
+        conv = _apply_visual_id(conv, inputs[diarize_idx], args, out_dir, inputs[diarize_idx].stem)
     meta = formats.Meta(
         title=inputs[diarize_idx].name,
         language=results[diarize_idx].language,
@@ -497,6 +601,18 @@ def main(argv: list[str] | None = None) -> int:
               "input file(s)", file=sys.stderr)
         return 1
 
+    if args.visual_id and args.visual_sample_spacing <= 0:
+        print(f"error: --visual-sample-spacing must be > 0, got "
+              f"{args.visual_sample_spacing}", file=sys.stderr)
+        return 1
+
+    track_mode = track_map is not None or track_speakers is not None
+    if args.visual_id and not args.diarize and diarize_idx is None and not track_mode:
+        print("error: --visual-id has no diarized speaker labels to corroborate; "
+              "combine with --diarize or --diarize-track (a plain --track-speakers/"
+              "--tracks recording is already exact, nothing to check)", file=sys.stderr)
+        return 1
+
     pipeline = None
     model = None
     try:
@@ -513,6 +629,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.diarize and diarize_idx is None:
                 _log(args.quiet, "note: --diarize is ignored in track mode "
                                  "(speakers come from the tracks)")
+            if args.visual_id and diarize_idx is None:
+                _log(args.quiet, "note: --visual-id is ignored in track mode "
+                                 "(every speaker is already exact -- nothing to "
+                                 "corroborate or auto-name)")
             _log(args.quiet, f"loading model '{args.model}' "
                              f"({args.device}/{args.compute_type}) ...")
             model = load_model(args.model, args.device, args.compute_type)
@@ -558,11 +678,12 @@ def main(argv: list[str] | None = None) -> int:
                                             model, punctuator)
 
         rc = 0
+        multi_input = len(args.inputs) > 1
         for inp in args.inputs:
             if track_map is not None:
                 rc |= _transcribe_tracks(inp, args, fmts, model, punctuator, track_map)
             else:
-                rc |= _transcribe_one(inp, args, fmts, pipeline, punctuator)
+                rc |= _transcribe_one(inp, args, fmts, pipeline, punctuator, multi_input=multi_input)
         return rc
     except audio.FFmpegNotFound as e:
         print(f"error: {e}", file=sys.stderr)
