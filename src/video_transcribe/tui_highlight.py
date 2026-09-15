@@ -44,6 +44,8 @@ _RULES: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
     # Our own [tui]/[key] prefixes and the "--- exit_code=... ---" summary.
     (re.compile(r"^\[[\w\-]+\]"), "bold #E09BFF"),
     (re.compile(r"---\s*exit_code=.*?---"), "bold"),
+    # LLM API references (Claude, anthropic) for visual distinction.
+    (re.compile(r"\b(?:Claude|anthropic)\b", re.IGNORECASE), "bold #FFD862"),
 )
 
 _WARNING_RE: Final = re.compile(r"\bwarning\b", re.IGNORECASE)

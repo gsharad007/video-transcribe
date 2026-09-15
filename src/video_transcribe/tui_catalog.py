@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from video_transcribe.diarize import DEFAULT_DIARIZE_MODEL
+from video_transcribe.visual_id import DEFAULT_NAME_THRESHOLD, DEFAULT_SAMPLE_SPACING
 from video_transcribe.voiceprint import DEFAULT_MATCH_THRESHOLD
 
 __all__ = (
@@ -27,6 +28,7 @@ __all__ = (
     "CATALOG",
     "CATEGORY_ORDER",
     "CATEGORY_LABELS",
+    "CATEGORY_COLORS",
     "ValidationError",
     "build_tokens",
     "grouped_catalog",
@@ -91,6 +93,8 @@ class Task:
     args: tuple[Arg, ...] = ()
     tags: tuple[str, ...] = field(default_factory=tuple)
     examples: tuple[Example, ...] = ()
+    # If true, this task sends data to an external LLM (Anthropic Claude).
+    llm: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -208,11 +212,12 @@ INPUTS = Arg("inputs", "paths", "Video/audio file(s) -- one per line.", required
              placeholder="C:\\clips\\talk.mp4")
 FORMAT = Arg("format", "str", "Output formats, comma-separated.", flag="--format",
              choices=_FMT_CHOICES, repeatable=True, placeholder="txt,srt,vtt,json")
-MODEL = Arg("model", "str", "Whisper model.", flag="--model", default="large-v3",
-            placeholder="large-v3 | large-v3-turbo | base")
-LANGUAGE = Arg("language", "str", "Language code (blank = autodetect).", flag="--language",
-               placeholder="en, ko, ...")
-DEVICE = Arg("device", "choice", "Inference device (cuda = NVIDIA only).", flag="--device",
+MODEL = Arg("model", "str", "Whisper model (large-v3 = highest quality).", flag="--model",
+            default="large-v3", choices=("large-v3", "large-v3-turbo", "base",
+                                         "large-v3-turbo-fp16"), placeholder="large-v3 | large-v3-turbo")
+LANGUAGE = Arg("language", "str", "Language code (blank = auto-detect).", flag="--language",
+               placeholder="en, ko, hi, ...")
+DEVICE = Arg("device", "choice", "Inference device (cuda = NVIDIA GPU only).", flag="--device",
              default="cpu", choices=("cpu", "cuda", "auto"))
 COMPUTE = Arg("compute_type", "str", "CTranslate2 compute type.", flag="--compute-type",
               default="int8", placeholder="int8 | float16")
@@ -220,223 +225,246 @@ HOTWORDS = Arg("hotwords", "str", "Bias terms (names/jargon), comma-separated.",
                placeholder="GrimeReaper, pyannote")
 HOTWORDS_FILE = Arg("hotwords_file", "path", "Hotwords file (.json or one term per line).",
                     flag="--hotwords-file")
-OUTPUT_DIR = Arg("output_dir", "path", "Output directory (blank = beside input).", flag="--output-dir")
-SPEAKER = Arg("speaker", "str", "Label the whole transcript with one speaker name.", flag="--speaker")
-NO_VAD = Arg("no_vad", "bool", "Disable voice-activity-detection filtering.", flag="--no-vad")
-NO_TIDY = Arg("no_tidy", "bool", "Skip the light readability pass.", flag="--no-tidy")
-NO_PUNCT = Arg("no_punctuate", "bool", "Skip ML punctuation/sentence restoration.", flag="--no-punctuate")
-KEEP_AUDIO = Arg("keep_audio", "bool", "Keep the intermediate 16 kHz WAV.", flag="--keep-audio")
+OUTPUT_DIR = Arg("output_dir", "path", "Output directory (blank = beside input file).",
+                 flag="--output-dir")
+SPEAKER = Arg("speaker", "str", "Label the whole transcript with one speaker name.",
+              flag="--speaker")
+NO_VAD = Arg("no_vad", "bool", "Disable voice-activity-detection (captures more, slower).",
+             flag="--no-vad")
+NO_TIDY = Arg("no_tidy", "bool", "Skip the light readability pass (keep raw casing/spacing).",
+              flag="--no-tidy")
+NO_PUNCT = Arg("no_punctuate", "bool", "Skip ML punctuation/sentence restoration.",
+               flag="--no-punctuate")
+KEEP_AUDIO = Arg("keep_audio", "bool", "Keep the intermediate 16 kHz WAV file.",
+                 flag="--keep-audio")
 VERBOSE = Arg("verbose", "bool", "Stream each segment as it is decoded.", flag="--verbose")
 QUIET = Arg("quiet", "bool", "Suppress progress output.", flag="--quiet")
 
-HF_TOKEN = Arg("hf_token", "str", "Hugging Face token (else uses $HF_TOKEN).", flag="--hf-token")
-SPEAKERS = Arg("speakers", "int", "Exact number of speakers, if known.", flag="--speakers")
-MIN_SPK = Arg("min_speakers", "int", "Lower bound on speakers.", flag="--min-speakers")
-MAX_SPK = Arg("max_speakers", "int", "Upper bound on speakers.", flag="--max-speakers")
-DIARIZE_MODEL = Arg("diarize_model", "str", "pyannote pipeline.", flag="--diarize-model",
-                    default=DEFAULT_DIARIZE_MODEL)
+HF_TOKEN = Arg("hf_token", "str", "Hugging Face token (else uses $HF_TOKEN env var).",
+               flag="--hf-token")
+SPEAKERS = Arg("speakers", "int", "Exact number of speakers, if known (more accurate).",
+               flag="--speakers")
+MIN_SPK = Arg("min_speakers", "int", "Lower bound on number of speakers.",
+              flag="--min-speakers")
+MAX_SPK = Arg("max_speakers", "int", "Upper bound on number of speakers.",
+              flag="--max-speakers")
+DIARIZE_MODEL = Arg("diarize_model", "str", "pyannote pipeline model.",
+                    flag="--diarize-model", default=DEFAULT_DIARIZE_MODEL)
 VOICEPRINTS = Arg("voiceprints", "path", "Voiceprint store JSON (auto-name speakers by voice).",
                   flag="--voiceprints")
 VOICE_THRESHOLD = Arg("voice_threshold", "float", "Cosine-similarity threshold for a voice match.",
                       flag="--voice-threshold", default=str(DEFAULT_MATCH_THRESHOLD))
+
+# Visual ID args
+VISUAL_ID = Arg("visual_id", "bool",
+                "OCR active-speaker tiles in Google Meet gallery-view to auto-name diarized speakers.",
+                flag="--visual-id")
+VISUAL_ROSTER = Arg("visual_roster", "str",
+                    "Known participant names (comma-separated) for visual matching.",
+                    flag="--visual-roster", placeholder="Mar, Sharad, John")
+VISUAL_REPORT = Arg("visual_report", "path",
+                    "Write the visual-id detection report JSON here.", flag="--visual-report")
+VISUAL_SAMPLE_SPACING = Arg("visual_sample_spacing", "float",
+                            "Frame-sampling interval (seconds) for visual ID.",
+                            flag="--visual-sample-spacing", default=str(DEFAULT_SAMPLE_SPACING))
+VISUAL_NAME_THRESHOLD = Arg("visual_name_threshold", "float",
+                            "Confidence threshold for a visual name match.",
+                            flag="--visual-name-threshold", default=str(DEFAULT_NAME_THRESHOLD))
+
 
 # The shared trailing block reused by every transcription mode, in a sensible
 # tab order (output shape first, then quality knobs, then flags).
 _COMMON_TAIL = (FORMAT, MODEL, LANGUAGE, DEVICE, COMPUTE, HOTWORDS, HOTWORDS_FILE,
                 OUTPUT_DIR, NO_VAD, NO_TIDY, NO_PUNCT, KEEP_AUDIO, VERBOSE, QUIET)
 
+
 # --------------------------------------------------------------------------- #
 # the catalog
 # --------------------------------------------------------------------------- #
 
-CATEGORY_ORDER = ("transcribe", "correct", "speakers", "media", "setup")
+CATEGORY_ORDER = (
+    "transcribe",   # everyday transcription jobs
+    "speakers",     # speaker diarization & voiceprints
+    "media",        # media manipulation (mux)
+    "visual",       # visual speaker identification
+    "correct",      # post-processing & correction
+    "setup",        # environment checks & setup
+)
+
 CATEGORY_LABELS = {
     "transcribe": "Transcribe",
-    "correct": "Correct & clean",
-    "speakers": "Voiceprints",
+    "speakers": "Speaker Diarization",
     "media": "Media",
-    "setup": "Setup & checks",
+    "visual": "Visual ID",
+    "correct": "Correct & Clean",
+    "setup": "Setup & Checks",
+}
+
+# Category sidebar colors for quick visual scanning.
+CATEGORY_COLORS: dict[str, str] = {
+    "transcribe": "#7AE582",
+    "speakers": "#E09BFF",
+    "media": "#7AE0E5",
+    "visual": "#FFD862",
+    "correct": "#FF8A8A",
+    "setup": "#A0A0A0",
 }
 
 _TASKS: tuple[Task, ...] = (
+    # ── Transcribe ──────────────────────────────────────────────────────
+
     Task(
         key="transcribe",
-        label="Transcribe (basic)",
+        label="Transcribe — basic",
         category="transcribe",
-        summary="The everyday job: transcribe one or more files to a readable transcript, "
-                "no speaker labels. Output lands beside each input (or in --output-dir). "
-                "Add --speaker to tag a single-presenter recording with one name.",
+        summary="Transcribe one or more video/audio files using Whisper "
+                "(large-v3 by default). Outputs a readable .txt transcript "
+                "beside each input. Add --format for .srt/.vtt/.json. "
+                "Use --speaker to tag a single-presenter recording.",
         argv_prefix=("-m", "video_transcribe"),
         args=(INPUTS, SPEAKER, *_COMMON_TAIL),
         tags=("transcribe", "whisper", "basic"),
     ),
     Task(
+        key="transcribe-fast",
+        label="Transcribe — fast (turbo)",
+        category="transcribe",
+        summary="Transcribe using large-v3-turbo for ~2x speed at slightly "
+                "lower quality. Good for quick drafts or when you just need "
+                "the gist. Use --no-vad to capture every utterance.",
+        argv_prefix=("-m", "video_transcribe"),
+        args=(INPUTS, SPEAKER, *_COMMON_TAIL),
+        tags=("transcribe", "whisper", "fast", "turbo"),
+    ),
+    Task(
+        key="transcribe-all-formats",
+        label="Transcribe — all output formats",
+        category="transcribe",
+        summary="Transcribe and write all four output formats: .txt, .srt, "
+                ".vtt, and .json. Useful when you need subtitles and the "
+                "structured data for further processing.",
+        argv_prefix=("-m", "video_transcribe"),
+        args=(INPUTS, SPEAKER, *_COMMON_TAIL),
+        tags=("transcribe", "whisper", "all-formats"),
+    ),
+    Task(
+        key="transcribe-english",
+        label="Transcribe — force English",
+        category="transcribe",
+        summary="Transcribe with language forced to English, skipping the "
+                "auto-detect step for slightly faster processing. "
+                "Use when the recording is definitely in English.",
+        argv_prefix=("-m", "video_transcribe"),
+        args=(INPUTS, *_COMMON_TAIL),
+        tags=("transcribe", "english", "whisper"),
+    ),
+
+    # ── Speaker Diarization ─────────────────────────────────────────────
+
+    Task(
         key="diarize",
         label="Transcribe + diarize speakers",
-        category="transcribe",
-        summary="Transcribe and label who-said-what with pyannote. Needs a Hugging Face token "
-                "(--hf-token or $HF_TOKEN) and the 'diarize' extra. Pass --speakers if you know "
-                "the count; point --voiceprints at a store to auto-name known voices.",
+        category="speakers",
+        summary="Transcribe and label who-said-what using pyannote diarization. "
+                "Needs a Hugging Face token (--hf-token or $HF_TOKEN) and the "
+                "'diarize' extra (uv sync --extra diarize). Pass --speakers if "
+                "you know the count for more accuracy.",
         argv_prefix=("-m", "video_transcribe", "--diarize"),
         args=(INPUTS, SPEAKERS, MIN_SPK, MAX_SPK, HF_TOKEN, DIARIZE_MODEL,
               VOICEPRINTS, VOICE_THRESHOLD, *_COMMON_TAIL),
         tags=("transcribe", "diarize", "speakers", "pyannote"),
     ),
     Task(
+        key="diarize-known-speakers",
+        label="Diarize — known speaker count",
+        category="speakers",
+        summary="Transcribe with diarization, telling pyannote the exact number "
+                "of speakers. This dramatically improves accuracy when you know "
+                "the count (e.g. a 2-person interview or 4-person panel).",
+        argv_prefix=("-m", "video_transcribe", "--diarize"),
+        args=(INPUTS, SPEAKERS, HF_TOKEN, *_COMMON_TAIL),
+        tags=("transcribe", "diarize", "speakers", "known-count"),
+    ),
+
+    # ── Multi-track ─────────────────────────────────────────────────────
+
+    Task(
         key="list-tracks",
         label="List audio tracks",
         category="transcribe",
-        summary="Print each input's audio tracks (index / codec / channels) and exit. Run this "
-                "first to find the track indices for the by-track modes below.",
+        summary="Inspect a file's audio tracks and exit. Print each track's "
+                "index, codec, and channels. Run this first to find track "
+                "indices for the by-track transcription modes below.",
         argv_prefix=("-m", "video_transcribe", "--list-tracks"),
         args=(INPUTS,),
-        tags=("inspect", "tracks"),
+        tags=("inspect", "tracks", "list"),
     ),
     Task(
         key="tracks-in-file",
         label="Transcribe by track (one file)",
         category="transcribe",
-        summary="Multi-track file (e.g. ReLive mic muxed into the video): transcribe each track "
-                "separately and label by track -- exact speakers, no diarization. Map with "
-                "--tracks like \"0=Mar,1=Sharad\" (see List audio tracks for indices).",
+        summary="Multi-track file (e.g. AMD ReLive recording with a separate "
+                "mic muxed in): transcribe each track separately and label by "
+                "track index. Exact speakers, no diarization needed. Use "
+                "--tracks '0=Desktop,1=Mic' to name each track.",
         argv_prefix=("-m", "video_transcribe"),
         args=(
             INPUTS,
-            Arg("tracks", "str", "Per-track speakers as IDX=NAME pairs.", flag="--tracks",
+            Arg("tracks", "str", "Track → speaker map: '0=Mar,1=Sharad'.", flag="--tracks",
                 required=True, placeholder="0=Mar,1=Sharad"),
             FORMAT, MODEL, LANGUAGE, HOTWORDS, OUTPUT_DIR, NO_TIDY, NO_PUNCT, VERBOSE, QUIET,
         ),
-        tags=("transcribe", "tracks", "speakers"),
+        tags=("transcribe", "tracks", "speakers", "relive"),
     ),
     Task(
         key="tracks-files",
         label="Transcribe parallel track files",
         category="transcribe",
-        summary="Separate files for one recording (e.g. video + separate mic .m4a): transcribe "
-                "each and merge by timestamp, labeled by --track-speakers like \"Mar,Sharad\" "
-                "(one name per file, in order). --mux also writes a combined .mkv.",
+        summary="Separate files for one recording (e.g. video.mp4 + mic.m4a): "
+                "transcribe each and merge by timestamp, labeled by "
+                "--track-speakers. Also supports --mux to write a combined .mkv.",
         argv_prefix=("-m", "video_transcribe"),
         args=(
             INPUTS,
-            Arg("track_speakers", "str", "Comma-separated speaker names, one per input file.",
+            Arg("track_speakers", "str", "Speaker names, one per file (comma-separated).",
                 flag="--track-speakers", required=True, placeholder="Mar,Sharad"),
             Arg("mux", "bool", "Also write a combined .mkv (Mix + Desktop + Mic).", flag="--mux"),
             FORMAT, MODEL, LANGUAGE, HOTWORDS, OUTPUT_DIR, NO_TIDY, NO_PUNCT, VERBOSE, QUIET,
         ),
-        tags=("transcribe", "tracks", "mux", "speakers"),
+        tags=("transcribe", "tracks", "mux", "speakers", "relive"),
     ),
     Task(
         key="hybrid",
-        label="Diarize one file + fixed tracks",
-        category="transcribe",
-        summary="Group call + your own mic: acoustically diarize one input (--diarize-track IDX) "
-                "while the other file(s) are fixed single-speaker tracks named by --track-speakers. "
-                "Diarized speakers come out generic (Speaker 1...); rename later with Correct.",
+        label="Hybrid — diarize + fixed tracks",
+        category="speakers",
+        summary="Group call + your own mic: acoustically diarize one input "
+                "(--diarize-track) while other files are fixed single-speaker "
+                "tracks. Best of both worlds for meetings where you have a "
+                "separate mic but the video has multiple voices.",
         argv_prefix=("-m", "video_transcribe"),
         args=(
             INPUTS,
-            Arg("diarize_track", "int", "0-based index of the input file to diarize.",
+            Arg("diarize_track", "int", "0-based index of the file to diarize.",
                 flag="--diarize-track", required=True, placeholder="0"),
-            Arg("track_speakers", "str", "Names for the OTHER (non-diarized) files, in order.",
+            Arg("track_speakers", "str", "Names for the OTHER (non-diarized) files.",
                 flag="--track-speakers", required=True, placeholder="Sharad"),
             SPEAKERS, MIN_SPK, MAX_SPK, HF_TOKEN, VOICEPRINTS, VOICE_THRESHOLD,
-            Arg("mux", "bool", "Also write a combined .mkv (Mix + Desktop + Mic).", flag="--mux"),
+            Arg("mux", "bool", "Also write a combined .mkv.", flag="--mux"),
             FORMAT, MODEL, LANGUAGE, HOTWORDS, OUTPUT_DIR, NO_TIDY, NO_PUNCT, VERBOSE, QUIET,
         ),
         tags=("transcribe", "diarize", "tracks", "hybrid", "speakers"),
     ),
-    Task(
-        key="correct",
-        label="Glossary correction (local)",
-        category="correct",
-        summary="Apply a glossary (term fixes + speaker names) to a finished transcript .json -- "
-                "deterministic, fully local, no re-transcription. Re-emits txt/srt/vtt/json beside "
-                "the input. Use --speakers to override the glossary's speaker map for one run.",
-        argv_prefix=("-m", "video_transcribe.correct"),
-        args=(
-            Arg("input", "path", "Transcript .json produced by video-transcribe.", required=True),
-            Arg("glossary", "path", "Glossary JSON (speaker_map + corrections).", flag="--glossary",
-                required=True),
-            Arg("speakers", "str", "Override speaker map, e.g. 'Speaker 1=JV,Speaker 2=Sharad'.",
-                flag="--speakers"),
-            OUTPUT_DIR,
-            Arg("format", "str", "Output formats (default: txt,srt,json).", flag="--format",
-                choices=_FMT_CHOICES, repeatable=True, placeholder="txt,srt,json"),
-        ),
-        tags=("correct", "glossary", "local"),
-    ),
-    Task(
-        key="llm-correct",
-        label="LLM correction (Claude API)",
-        category="correct",
-        summary="Correction-only pass over a transcript .json via the Claude API: fixes misheard "
-                "names/jargon and obvious ASR slips, 1:1 with the input, never rewrites. Writes "
-                "separate .llm.* files + a .llm-changes.txt diff. Sends text off-machine; needs the "
-                "'llm' extra + ANTHROPIC_API_KEY.",
-        argv_prefix=("-m", "video_transcribe.llm_correct"),
-        args=(
-            Arg("input", "path", "Transcript .json produced by video-transcribe.", required=True),
-            Arg("glossary", "path", "Optional glossary JSON for context.", flag="--glossary"),
-            Arg("model", "str", "Claude model.", flag="--model", default="claude-opus-4-8"),
-            OUTPUT_DIR,
-            Arg("format", "str", "Output formats (default: txt,json).", flag="--format",
-                choices=("txt", "json"), repeatable=True, placeholder="txt,json"),
-        ),
-        tags=("correct", "llm", "claude", "api"),
-    ),
-    Task(
-        key="voiceprint-list",
-        label="Voiceprints: list",
-        category="speakers",
-        summary="List enrolled people in a voiceprint store and how many samples each has.",
-        argv_prefix=("-m", "video_transcribe.voiceprint", "list"),
-        args=(Arg("store", "path", "Voiceprint store JSON.", flag="--store", required=True),),
-        tags=("voiceprint", "list"),
-    ),
-    Task(
-        key="voiceprint-enroll",
-        label="Voiceprints: enroll",
-        category="speakers",
-        summary="Grow a voiceprint store from an already-corrected transcript .json + its source "
-                "media, so future diarized recordings auto-name these voices. Use --names to enroll "
-                "only some speakers, --track for one track of a multi-track file.",
-        argv_prefix=("-m", "video_transcribe.voiceprint", "enroll"),
-        args=(
-            Arg("transcript", "path", "Corrected transcript .json (real speaker names).", required=True),
-            Arg("media", "path", "Audio/video file that speech came from.", required=True),
-            Arg("store", "path", "Voiceprint store JSON (created/updated).", flag="--store", required=True),
-            Arg("names", "str", "Only enroll these speakers (comma-separated; default: all).", flag="--names"),
-            Arg("track", "int", "0-based audio track index for a multi-track file.", flag="--track"),
-            HF_TOKEN,
-        ),
-        tags=("voiceprint", "enroll"),
-    ),
-    Task(
-        key="voiceprint-validate",
-        label="Voiceprints: validate",
-        category="speakers",
-        summary="Check a store's matches against a transcript whose speaker names you've already "
-                "confirmed, without changing the store -- a sanity check before trusting it.",
-        argv_prefix=("-m", "video_transcribe.voiceprint", "validate"),
-        args=(
-            Arg("transcript", "path", "Corrected transcript .json (real speaker names).", required=True),
-            Arg("media", "path", "Audio/video file that speech came from.", required=True),
-            Arg("store", "path", "Voiceprint store JSON.", flag="--store", required=True),
-            Arg("names", "str", "Only validate these speakers (comma-separated).", flag="--names"),
-            Arg("track", "int", "0-based audio track index for a multi-track file.", flag="--track"),
-            Arg("threshold", "float", "Match threshold.", flag="--threshold",
-                default=str(DEFAULT_MATCH_THRESHOLD)),
-            HF_TOKEN,
-        ),
-        tags=("voiceprint", "validate"),
-    ),
+
+    # ── Media ───────────────────────────────────────────────────────────
+
     Task(
         key="mux",
-        label="Mux video + mic -> MKV",
+        label="Mux video + mic → MKV",
         category="media",
-        summary="Combine a video (with its desktop audio) + a separate mic file into one .mkv: a "
-                "default Mix track plus isolated Desktop and Mic tracks. Video is stream-copied "
-                "(no re-encode). No transcript is produced.",
+        summary="Combine a video file (with desktop audio) + a separate "
+                "microphone file into one .mkv with three audio tracks: a "
+                "default Mix track plus isolated Desktop and Mic tracks. "
+                "Video is stream-copied (no re-encode).",
         argv_prefix=("-m", "video_transcribe.mux"),
         args=(
             Arg("video", "path", "Video file (with desktop/system audio).", required=True),
@@ -445,41 +473,199 @@ _TASKS: tuple[Task, ...] = (
         ),
         tags=("media", "mux", "ffmpeg"),
     ),
+
+    # ── Visual ID ───────────────────────────────────────────────────────
+
+    Task(
+        key="visual-id",
+        label="Visual speaker ID (Google Meet)",
+        category="visual",
+        summary="OCR the active-speaker-highlighted tile's name label in a "
+                "Google Meet gallery-view recording to auto-name diarized "
+                "speakers. Fully local (EasyOCR) — no external API calls. "
+                "Best combined with --diarize for full speaker labeling.",
+        argv_prefix=("-m", "video_transcribe", "--diarize", "--visual-id"),
+        args=(
+            INPUTS,
+            SPEAKERS, MIN_SPK, MAX_SPK, HF_TOKEN, DIARIZE_MODEL,
+            VISUAL_ROSTER, VISUAL_REPORT, VISUAL_SAMPLE_SPACING,
+            VISUAL_NAME_THRESHOLD, VOICEPRINTS, VOICE_THRESHOLD,
+            *_COMMON_TAIL,
+        ),
+        tags=("visual", "meet", "ocr", "speakers", "diarize"),
+    ),
+
+    # ── Correct ─────────────────────────────────────────────────────────
+
+    Task(
+        key="correct",
+        label="Correct — glossary (local, no LLM)",
+        category="correct",
+        summary="Apply a glossary (term fixes + speaker names) to a finished "
+                "transcript .json. Fully local and deterministic — no re-"
+                "transcription, no external API. Re-emits txt/srt/vtt/json.",
+        argv_prefix=("-m", "video_transcribe.correct"),
+        args=(
+            Arg("input", "path", "Transcript .json from video-transcribe.", required=True),
+            Arg("glossary", "path", "Glossary JSON (speaker_map + corrections).", flag="--glossary",
+                required=True),
+            Arg("speakers", "str", "Override speaker map for this run.", flag="--speakers"),
+            OUTPUT_DIR,
+            Arg("format", "str", "Output formats (default: txt,srt,json).", flag="--format",
+                choices=_FMT_CHOICES, repeatable=True, placeholder="txt,srt,json"),
+        ),
+        tags=("correct", "glossary", "local", "post-process"),
+    ),
+    Task(
+        key="correct-speaker-at",
+        label="Correct — speaker at time range",
+        category="correct",
+        summary="Override ONE utterance's speaker by its start time. This is "
+                "the fix for a visual_id.py merge_suspected finding: when "
+                "diarization merged two people into one label, use this to "
+                "assign a specific time range to someone else.",
+        argv_prefix=("-m", "video_transcribe.correct"),
+        args=(
+            Arg("input", "path", "Transcript .json from video-transcribe.", required=True),
+            Arg("speaker_at", "str", "Time=Name overrides (repeatable), e.g. '37.3=Sharad'.",
+                flag="--speaker-at", repeatable=True, placeholder="37.3=Sharad"),
+            OUTPUT_DIR,
+        ),
+        tags=("correct", "speaker", "time-range", "local"),
+    ),
+    Task(
+        key="llm-correct",
+        label="LLM ✦ Correction (Claude API — sends text off-machine)",
+        category="correct",
+        summary="Correction-only pass over a transcript .json via the Claude "
+                "API: fixes misheard names/jargon and obvious ASR slips. "
+                "Sends transcript text off-machine to Anthropic; costs a few "
+                "cents per meeting. Writes separate .llm.* files + a diff. "
+                "Needs the 'llm' extra + ANTHROPIC_API_KEY.",
+        argv_prefix=("-m", "video_transcribe.llm_correct"),
+        args=(
+            Arg("input", "path", "Transcript .json from video-transcribe.", required=True),
+            Arg("glossary", "path", "Optional glossary JSON for context.", flag="--glossary"),
+            Arg("model", "str", "Claude model name.", flag="--model", default="claude-opus-4-8"),
+            OUTPUT_DIR,
+            Arg("format", "str", "Output formats (default: txt,json).", flag="--format",
+                choices=("txt", "json"), repeatable=True, placeholder="txt,json"),
+        ),
+        tags=("correct", "llm", "claude", "api", "off-machine"),
+        llm=True,
+    ),
+
+    # ── Voiceprints ─────────────────────────────────────────────────────
+
+    Task(
+        key="voiceprint-list",
+        label="Voiceprints: list enrolled",
+        category="speakers",
+        summary="List all enrolled people in a voiceprint store and how many "
+                "voice samples each has. A sanity check before using "
+                "voiceprints for auto-naming speakers.",
+        argv_prefix=("-m", "video_transcribe.voiceprint", "list"),
+        args=(Arg("store", "path", "Voiceprint store JSON.", flag="--store", required=True),),
+        tags=("voiceprint", "list", "enrolled"),
+    ),
+    Task(
+        key="voiceprint-enroll",
+        label="Voiceprints: enroll speakers",
+        category="speakers",
+        summary="Grow a voiceprint store from an already-corrected transcript "
+                ".json + its source media. Future diarized recordings will then "
+                "auto-name these voices. Use --names to enroll only specific people.",
+        argv_prefix=("-m", "video_transcribe.voiceprint", "enroll"),
+        args=(
+            Arg("transcript", "path", "Corrected transcript .json (real speaker names).", required=True),
+            Arg("media", "path", "Audio/video file that speech came from.", required=True),
+            Arg("store", "path", "Voiceprint store JSON (created/updated).", flag="--store", required=True),
+            Arg("names", "str", "Only enroll these speakers (comma-separated; default: all).", flag="--names"),
+            Arg("track", "int", "0-based audio track index for multi-track file.", flag="--track"),
+            HF_TOKEN,
+        ),
+        tags=("voiceprint", "enroll", "speaker-identification"),
+    ),
+    Task(
+        key="voiceprint-validate",
+        label="Voiceprints: validate against transcript",
+        category="speakers",
+        summary="Check a store's matches against a transcript whose speaker "
+                "names you've already confirmed — a sanity check before "
+                "trusting the store for auto-naming on future recordings.",
+        argv_prefix=("-m", "video_transcribe.voiceprint", "validate"),
+        args=(
+            Arg("transcript", "path", "Corrected transcript .json (real speaker names).", required=True),
+            Arg("media", "path", "Audio/video file that speech came from.", required=True),
+            Arg("store", "path", "Voiceprint store JSON.", flag="--store", required=True),
+            Arg("names", "str", "Only validate these speakers (comma-separated).", flag="--names"),
+            Arg("track", "int", "0-based audio track index for multi-track file.", flag="--track"),
+            Arg("threshold", "float", "Match confidence threshold.", flag="--threshold",
+                default=str(DEFAULT_MATCH_THRESHOLD)),
+            HF_TOKEN,
+        ),
+        tags=("voiceprint", "validate", "sanity-check"),
+    ),
+
+    # ── Setup ───────────────────────────────────────────────────────────
+
     Task(
         key="doctor",
         label="Environment doctor",
         category="setup",
-        summary="Check the local setup: ffmpeg/ffprobe on PATH, the optional extras "
-                "(diarize / readable / llm), and the tokens diarization and LLM correction need. "
+        summary="Check the local setup: ffmpeg/ffprobe on PATH, Python version, "
+                "and all optional extras (diarize, readable, llm, visual, tui). "
+                "Also checks Hugging Face and Anthropic tokens. "
                 "Run this first if a job fails to start.",
         argv_prefix=("-m", "video_transcribe.tui_doctor"),
         args=(),
-        tags=("setup", "doctor", "check"),
+        tags=("setup", "doctor", "check", "diagnostics"),
     ),
 )
 
-# Ready-made runs shown in the TUI, grounded in this project's actual usage:
-# AMD ReLive recordings (video + a "Separate Microphone Track"), a shared
-# glossary for term/name fixes, and a Claude correction pass over the result --
-# plus the canonical examples from the README. File names are placeholders;
-# edit the paths in the form before running.
+# Ready-made presets / examples, grounded in this project's actual usage:
+# AMD ReLive recordings (video + separate mic), glossary corrections, Claude
+# passes, Google Meet recordings, etc. File names are placeholders; edit the
+# paths in the form before running.
 _EXAMPLES: dict[str, tuple[Example, ...]] = {
     "transcribe": (
         Example("Highest quality (large-v3); transcript beside the input",
                 {"inputs": "talk.mp4"}),
-        Example("Faster (turbo), force English, also write SRT",
-                {"inputs": "clip.mp4", "model": "large-v3-turbo", "language": "en",
-                 "format": "txt,srt"}),
-        Example("Single presenter -- label the whole transcript with one name",
+        Example("Also write SRT + VTT subtitles alongside the text",
+                {"inputs": "talk.mp4", "format": "txt,srt,vtt"}),
+        Example("Single presenter -- label with one name",
                 {"inputs": "lecture.mp4", "speaker": "Sharad"}),
+        Example("Quick draft with turbo model, also write JSON",
+                {"inputs": "clip.mp4", "model": "large-v3-turbo", "format": "txt,json"}),
+        Example("Multi-file batch transcription",
+                {"inputs": "clip1.mp4\nclip2.mp4\nclip3.mp4"}),
+    ),
+    "transcribe-fast": (
+        Example("Fast turbo transcribe with all output formats",
+                {"inputs": "quick-draft.mp4", "model": "large-v3-turbo",
+                 "format": "txt,srt,vtt,json"}),
+    ),
+    "transcribe-all-formats": (
+        Example("Transcribe and write every output format",
+                {"inputs": "full-meeting.mp4", "format": "txt,srt,vtt,json"}),
+    ),
+    "transcribe-english": (
+        Example("Force English for a known-English recording",
+                {"inputs": "english-talk.mp4", "language": "en"}),
     ),
     "diarize": (
-        Example("Label speakers (needs an HF token); write txt + srt",
+        Example("Label speakers (needs HF token); write txt + srt",
                 {"inputs": "meeting.mp4", "format": "txt,srt"}),
         Example("Tell pyannote there are exactly 2 speakers",
                 {"inputs": "interview.mp4", "speakers": "2"}),
         Example("Auto-name known voices from a voiceprint store",
                 {"inputs": "meeting.mp4", "speakers": "4", "voiceprints": "voiceprints.json"}),
+    ),
+    "diarize-known-speakers": (
+        Example("3-person panel discussion",
+                {"inputs": "panel.mp4", "speakers": "3"}),
+        Example("2-person interview",
+                {"inputs": "interview.mp4", "speakers": "2"}),
     ),
     "list-tracks": (
         Example("Inspect a ReLive recording's audio tracks (find the indices)",
@@ -500,12 +686,25 @@ _EXAMPLES: dict[str, tuple[Example, ...]] = {
                 {"inputs": "meeting.mp4\nmeeting.m4a", "diarize_track": "0",
                  "speakers": "4", "track_speakers": "Sharad"}),
     ),
+    "mux": (
+        Example("Merge video + separate mic into one playable .mkv",
+                {"video": "meeting.mp4", "mic": "meeting.m4a"}),
+    ),
+    "visual-id": (
+        Example("Google Meet gallery-view: OCR name labels + diarize",
+                {"inputs": "google-meet.mp4", "speakers": "5",
+                 "visual_roster": "Mar,Sharad,Ryan,Ness,John"}),
+    ),
     "correct": (
         Example("Apply glossary term fixes + speaker names to a transcript",
                 {"input": "meeting.json", "glossary": "g.json"}),
         Example("Override just the speaker names for this run",
                 {"input": "meeting.json", "glossary": "g.json",
                  "speakers": "Speaker 1=JV,Speaker 2=Sharad"}),
+    ),
+    "correct-speaker-at": (
+        Example("Fix a merge error: assign utterance at 37.3s to Sharad",
+                {"input": "meeting.json", "speaker_at": "37.3=Sharad"}),
     ),
     "llm-correct": (
         Example("Claude fixes misheard names/jargon, using a glossary for context",
@@ -519,18 +718,20 @@ _EXAMPLES: dict[str, tuple[Example, ...]] = {
     ),
     "voiceprint-enroll": (
         Example("Enroll everyone from an already-corrected transcript",
-                {"transcript": "meeting.json", "media": "meeting.mp4", "store": "voiceprints.json"}),
+                {"transcript": "meeting.json", "media": "meeting.mp4",
+                 "store": "voiceprints.json"}),
         Example("Enroll named people from the Desktop track of a muxed .mkv",
                 {"transcript": "meeting.json", "media": "meeting.with-mic.mkv",
                  "store": "voiceprints.json", "names": "Ryan,Mar,Ness,John", "track": "1"}),
     ),
     "voiceprint-validate": (
         Example("Sanity-check the store against a confirmed transcript",
-                {"transcript": "meeting.json", "media": "meeting.mp4", "store": "voiceprints.json"}),
+                {"transcript": "meeting.json", "media": "meeting.mp4",
+                 "store": "voiceprints.json"}),
     ),
-    "mux": (
-        Example("Merge video + separate mic into one playable .mkv",
-                {"video": "meeting.mp4", "mic": "meeting.m4a"}),
+    "doctor": (
+        Example("Run the full environment check (no arguments needed)",
+                {}),
     ),
 }
 

@@ -32,6 +32,7 @@ from typing import ClassVar, Final, Literal
 
 from video_transcribe.tui_catalog import (
     CATALOG,
+    CATEGORY_COLORS,
     CATEGORY_LABELS,
     Arg,
     Example,
@@ -118,7 +119,9 @@ def _final_state(exit_code: int, warnings: int) -> TaskState:
 def _task_label(task: Task, state: TaskState) -> str:
     marker = _STATE_MARKER[state]
     color = _STATE_COLOR[state]
-    return f"[{color}]{marker}{task.label}[/]" if color else f"{marker}{task.label}"
+    llm_badge = " ✦" if task.llm else ""
+    base = f"[{color}]{marker}{task.label}{llm_badge}[/]" if color else f"{marker}{task.label}{llm_badge}"
+    return base
 
 
 def _matches_filter(task: Task, query: str) -> bool:
@@ -209,6 +212,7 @@ class TranscribeTUI(App[int]):
     #main { width: 1fr; padding: 1 2; }
     #task-summary { margin-bottom: 1; color: $secondary; height: auto; }
     #preview { color: $text-muted; background: $boost; padding: 0 1; height: auto; margin-bottom: 1; }
+    #llm-warning { color: #FFD862; background: $boost; padding: 0 1; height: auto; margin-bottom: 1; }
     #form-area { height: 1fr; min-height: 6; border: round $panel; padding: 0 1; }
     #button-row { height: 3; align: left middle; }
     #button-row Button { margin-right: 1; min-width: 12; }
@@ -259,6 +263,7 @@ class TranscribeTUI(App[int]):
             with Vertical(id="main"):
                 yield Static("Pick a task on the left.", id="task-summary")
                 yield Static("", id="preview")
+                yield Static("", id="llm-warning")
                 yield VerticalScroll(id="form-area")
                 with Horizontal(id="button-row"):
                     yield Button("Run (r)", id="run-button", variant="primary", disabled=True)
@@ -299,8 +304,10 @@ class TranscribeTUI(App[int]):
             matching = [t for t in tasks if _matches_filter(t, self._filter_query)]
             if not matching:
                 continue
+            color = CATEGORY_COLORS.get(category, "")
             header = CATEGORY_LABELS.get(category, category).upper()
-            list_view.append(ListItem(Label(f"  {header}"), id=f"header-{category}",
+            header_text = f"[{color}]  {header}[/]" if color else f"  {header}"
+            list_view.append(ListItem(Label(header_text), id=f"header-{category}",
                                        classes="category-header"))
             for task in matching:
                 list_view.append(ListItem(Label(_task_label(task, self._state_of(task.key))),
@@ -326,6 +333,13 @@ class TranscribeTUI(App[int]):
         self._selected = key
         task = CATALOG[key]
         self.query_one("#task-summary", Static).update(f"[b]{task.label}[/]\n{task.summary}")
+        # Show LLM warning for tasks that send data off-machine
+        if task.llm:
+            self.query_one("#llm-warning", Static).update(
+                "[bold #FFD862]⚠ This task sends transcript text off-machine to the Claude API. "
+                "Costs a few cents per run. Do not use for confidential content.[/]")
+        else:
+            self.query_one("#llm-warning", Static).update("")
         await self._rebuild_form(task)
         self._refresh_buttons()
         self._update_preview()
