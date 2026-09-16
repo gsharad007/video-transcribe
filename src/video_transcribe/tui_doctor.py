@@ -36,6 +36,15 @@ def _module_present(module: str) -> bool:
         return False
 
 
+# `uv sync --extra X` reconciles the environment to exactly that extra: it
+# UNINSTALLS extras it wasn't asked for. Installing one extra on its own
+# silently removed three others once, and the loss only surfaced weeks later
+# as transcripts quietly missing ML punctuation. Every hint therefore names the
+# full combined command rather than the single extra being reported.
+SYNC_ALL = ("uv sync --extra diarize --extra readable --extra llm "
+            "--extra visual --extra tui")
+
+
 def check_environment() -> list[Check]:
     checks: list[Check] = []
 
@@ -64,28 +73,37 @@ def check_environment() -> list[Check]:
     checks.append(Check(
         "diarize extra", diarize_ok, False,
         "installed (torch + pyannote)" if diarize_ok else "missing",
-        "" if diarize_ok else "For --diarize / voiceprints: uv sync --extra diarize",
+        "" if diarize_ok else f"For --diarize / voiceprints: {SYNC_ALL}",
     ))
 
     readable_ok = _module_present("punctuators")
     checks.append(Check(
         "readable extra", readable_ok, False,
         "installed (punctuators)" if readable_ok else "missing",
-        "" if readable_ok else "For ML punctuation: uv sync --extra readable",
+        "" if readable_ok else
+        f"For ML punctuation (its absence does NOT error, it just silently "
+        f"produces choppier text): {SYNC_ALL}",
     ))
 
     llm_ok = _module_present("anthropic")
     checks.append(Check(
         "llm extra", llm_ok, False,
         "installed (anthropic)" if llm_ok else "missing",
-        "" if llm_ok else "For LLM correction: uv sync --extra llm",
+        "" if llm_ok else f"For LLM correction: {SYNC_ALL}",
+    ))
+
+    visual_ok = _module_present("easyocr") and _module_present("PIL")
+    checks.append(Check(
+        "visual extra", visual_ok, False,
+        "installed (easyocr + pillow)" if visual_ok else "missing",
+        "" if visual_ok else f"For --visual-id (Google Meet speaker OCR): {SYNC_ALL}",
     ))
 
     tui_ok = _module_present("textual") and _module_present("psutil")
     checks.append(Check(
         "tui extra", tui_ok, False,
         "installed (textual + psutil)" if tui_ok else "missing",
-        "" if tui_ok else "For this TUI: uv sync --extra tui",
+        "" if tui_ok else f"For this TUI: {SYNC_ALL}",
     ))
 
     hf = bool(os.environ.get("HF_TOKEN"))

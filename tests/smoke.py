@@ -9,6 +9,7 @@ from video_transcribe import formats, merge
 from video_transcribe.correct import correct_conversation, resolve_speaker_at, resolve_speaker_map
 from video_transcribe.diarize import SpeakerTurn
 from video_transcribe.llm_correct import correct_texts_with_llm, diff_report
+from video_transcribe.qc import check_transcript, find_phrase_repeats
 from video_transcribe.transcribe import Segment, TranscriptionResult, Word
 from video_transcribe.visual_id import (
     VisualReading, auto_name_from_visual, check_label_consistency, detect_border,
@@ -544,6 +545,76 @@ def test_formats():
     print(txt)
 
 
+def _seg(i, start, end, text, speaker="Sharad"):
+    return {"id": i, "start": start, "end": end, "text": text, "speaker": speaker}
+
+
+def test_qc_repeat_tiers():
+    # The real Sync4 defect: one clause repeated 17x. Must be caught.
+    loop = "and then I'll call it done " * 17
+    hits = find_phrase_repeats(loop)
+    assert hits and max(r for r, _n, _p in hits) >= 3, hits
+
+    # Natural short disfluency must NOT reach the same bar. "yeah yeah yeah"
+    # is 3 words total, under the min-run floor, so it isn't reported at all.
+    assert find_phrase_repeats("yeah yeah yeah that works") == []
+    print("[ok] qc: 17x clause loop detected, 3x one-word stutter ignored")
+
+
+def test_qc_impossible_rate_needs_repetition():
+    # Mild compression on coherent, non-repeating speech = timing only.
+    # (Real case: Sync9, 19 words in 1.0s, content sensible and unique.)
+    benign = {"segments": [
+        _seg(0, 0.0, 30.0, "Something entirely different was discussed here at length."),
+        _seg(1, 30.0, 31.0, "So I think I should be up and running by Thursday with "
+                            "the AI stuff and then maybe."),
+        _seg(2, 31.0, 60.0, "A completely unrelated closing remark follows now."),
+    ]}
+    kinds = {(f.kind, f.severity) for f in check_transcript(benign)}
+    assert ("impossible_rate", "timing") in kinds, kinds
+    assert ("impossible_rate", "hallucination") not in kinds, kinds
+
+    # Same impossible rate, but echoing the neighbour verbatim = the real
+    # defect (reproduces Sync12 ~400.7s: "binds things together" came back).
+    echoing = {"segments": [
+        _seg(0, 0.0, 30.0, "Which is another thing that kind of binds things together."),
+        _seg(1, 30.0, 30.2, "Yeah I think it is a really good thing to do and it kind "
+                            "of binds things together which is true."),
+        _seg(2, 30.2, 60.0, "Anyway moving on to the next topic entirely."),
+    ]}
+    assert any(f.kind == "impossible_rate" and f.severity == "hallucination"
+               for f in check_transcript(echoing))
+    print("[ok] qc: impossible rate alone = timing; rate + echoed phrase = hallucination")
+
+
+def test_qc_extreme_rate_and_duplicate_speaker():
+    # 23 words in 0.04s (~575 w/s, real Engineering Meeting case): the segment
+    # has no duration to hold its text, so it escalates without needing a repeat.
+    extreme = {"segments": [
+        _seg(0, 906.2, 906.24, "Going to have a lot of questions and you do not want "
+                               "to be like oh I have no idea what to do here now"),
+    ]}
+    assert any(f.severity == "hallucination" for f in check_transcript(extreme))
+
+    # Two raw labels resolving to one name inflate the header speaker count.
+    dupes = {"segments": [], "utterances": [], "speakers": ["Mar", "Speaker 1", "Mar"]}
+    found = [f for f in check_transcript(dupes) if f.kind == "duplicate_speaker"]
+    assert len(found) == 1 and found[0].speaker == "Mar", found
+    print("[ok] qc: extreme rate escalates alone; duplicate speaker name detected")
+
+
+def test_qc_clean_transcript_has_no_review_findings():
+    clean = {
+        "speakers": ["Mar", "Sharad"],
+        "utterances": [{"start": 0.0, "end": 8.0, "speaker": "Mar",
+                        "text": "How is the material crash investigation going today?"}],
+        "segments": [_seg(0, 0.0, 8.0, "How is the material crash investigation "
+                                       "going today?", "Mar")],
+    }
+    assert [f for f in check_transcript(clean) if f.needs_review] == []
+    print("[ok] qc: a clean transcript produces no review-level findings")
+
+
 if __name__ == "__main__":
     test_diarized()
     test_no_diarize()
@@ -565,5 +636,9 @@ if __name__ == "__main__":
     test_label_crop_box()
     test_check_label_consistency()
     test_auto_name_from_visual_never_renames_resolved_label()
+    test_qc_repeat_tiers()
+    test_qc_impossible_rate_needs_repetition()
+    test_qc_extreme_rate_and_duplicate_speaker()
+    test_qc_clean_transcript_has_no_review_findings()
     test_formats()
     print("\nALL SMOKE CHECKS PASSED")

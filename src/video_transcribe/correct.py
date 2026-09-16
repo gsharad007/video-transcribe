@@ -40,6 +40,23 @@ def fix_text(text: str, compiled: list[tuple[re.Pattern, str]]) -> str:
     return text
 
 
+def parse_corrections(specs: list[str] | None) -> list[dict]:
+    """Turn ``--correction "FROM=TO"`` specs into glossary-shaped correction dicts.
+
+    Splits on the FIRST ``=`` so the replacement may contain one, and keeps the
+    original spacing of FROM (a repetition-loop trim is a long multi-word
+    phrase, not a single token).
+    """
+    out: list[dict] = []
+    for spec in specs or []:
+        frm, sep, to = spec.partition("=")
+        if not sep or not frm.strip():
+            raise SystemExit(f"error: bad --correction entry {spec!r}. Use FROM=TO, "
+                             'e.g. --correction "Pral=Carolyn"')
+        out.append({"from": frm.strip(), "to": to.strip()})
+    return out
+
+
 def resolve_speaker_map(glossary: dict, speakers_arg: str | None) -> dict:
     """Resolve the effective speaker_map from a glossary + the --speakers CLI arg.
 
@@ -170,6 +187,13 @@ def main(argv: list[str] | None = None) -> int:
                         "someone else, leaving every other utterance under that label's "
                         "existing name untouched. Takes priority over --speakers/the "
                         "glossary's whole-label map for the matched utterance.")
+    p.add_argument("--correction", action="append", default=None, metavar="FROM=TO",
+                   help="One-off text fix applied on top of the glossary, e.g. "
+                        "--correction \"Pral=Carolyn\" (repeatable, case-insensitive, "
+                        "word-boundary). For a fix that belongs to this recording only "
+                        "-- trimming a repetition-loop artifact, or a mis-heard name not "
+                        "worth adding to the shared glossary -- so you don't have to "
+                        "hand-build a merged temporary glossary file.")
     p.add_argument("-o", "--output-dir", type=Path, default=None,
                    help="output directory (default: next to the input)")
     p.add_argument("-f", "--format", dest="formats", action="append",
@@ -178,7 +202,9 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     glossary = json.loads(args.glossary.read_text(encoding="utf-8")) if args.glossary else {}
-    compiled = compile_corrections(glossary.get("corrections", []))
+    corrections = list(glossary.get("corrections", []))
+    corrections += parse_corrections(args.correction)
+    compiled = compile_corrections(corrections)
     speaker_map = resolve_speaker_map(glossary, args.speakers)
 
     data = json.loads(args.input.read_text(encoding="utf-8"))

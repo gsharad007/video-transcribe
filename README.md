@@ -47,10 +47,13 @@ uv sync --extra tui          # one-time
 uv run video-transcribe-tui  # launch
 ```
 
-- **Left:** every task, grouped and ordered by how often you'd run them —
-  Transcribe · Transcribe + diarize · List audio tracks · by-track modes ·
-  Correct (glossary / LLM) · Voiceprints (list / enroll / validate) · Mux ·
-  Environment doctor. Type to fuzzy-filter.
+- **Left:** every task, grouped and ordered by how often you'd run them.
+  **1-1 sync** comes first — the recurring video+own-mic job, pre-set to the
+  whole combination (`--track-speakers`, `--mux`, glossary hotwords,
+  txt+srt+json, streaming) so it's one command instead of six flags. Then
+  Transcribe · **Check Transcript** (hallucination scan, visual-ID review) ·
+  Diarize + Voiceprints · Mux · Visual ID · Correct (glossary / split a merged
+  label / LLM) · Environment doctor. Type to fuzzy-filter.
 - **Right:** ready-made **examples** for each task (the common runs from this
   project — ReLive separate-mic, diarize, glossary/LLM correction, voiceprints);
   click **Load** to drop one into the form. Below them, one widget per CLI option
@@ -330,6 +333,43 @@ Known limitation: a genuine minority speaker whose only contribution is a
 very short utterance may not get enough sampled frames to be caught — a safe
 miss, not a wrong guess, but worth knowing about.
 
+## Checking a transcript before you trust it
+
+Whisper's failure modes on real meeting audio are quiet: the text stays fluent
+and plausible while repeating itself or drifting, so a transcript that reads
+fine at a glance can still be wrong. `qc` scans for the specific shapes that
+have actually occurred in this project's recordings.
+
+```pwsh
+# check the transcript you just produced
+uv run video-transcribe-qc meeting.json
+
+# sweep a whole folder of past transcripts, listing only real problems
+uv run video-transcribe-qc --glob "C:\Users\me\Videos\*.json" --quiet
+```
+
+It reports two tiers, and the distinction matters:
+
+- **REVIEW** — the text is probably corrupted. Verbatim repetition loops
+  (`"and then I'll call it done"` x17), non-English drift in an English
+  recording, a segment holding more words than its own duration allows *and*
+  repeating a phrase from its neighbour, or the same name listed twice in
+  `speakers`.
+- **info** — worth seeing, probably fine. A segment whose timestamp is
+  compressed but whose text is coherent and unique is a timing estimate being
+  wrong, not a hallucination. A 60s+ segment means VAD never found a pause;
+  that is normal for an open mic with room tone, though it is the condition
+  the decode loops tend to appear in.
+
+Speed alone is deliberately not treated as proof — it has to come with
+repetition. A short interjection landing on a 0.02s boundary ("Yeah.") is
+rounding, not a defect, so very short segments are ignored entirely. Exit code
+is non-zero when anything needs review.
+
+Known gap: a loop that paraphrases rather than repeating verbatim (same idea,
+slightly different words each time) is only caught when the rate is also
+impossible. Those show up as `info` rather than `REVIEW`.
+
 ## Full workflow, start to finish
 
 Putting the pieces above together — this is the whole recurring loop as one
@@ -340,14 +380,18 @@ sequence, for a 1-1 recorded as video (the other person) + separate mic (you):
 uv run video-transcribe meeting.mp4 meeting.m4a --track-speakers "Mar,Sharad" `
   --hotwords-file glossary.json --mux -f txt -f srt -f json
 
-# 2. glossary term corrections (speakers are already exact from step 1, so no --speakers)
+# 2. check it for repetition loops / drift / bad timing before reading it
+uv run video-transcribe-qc meeting.json
+
+# 3. glossary term corrections (speakers are already exact from step 1, so no --speakers).
+#    --correction applies a fix to THIS recording only, without editing the shared glossary.
 uv run python -m video_transcribe.correct meeting.json --glossary glossary.json -f txt -f srt -f json
 
-# 3. before teaching the store anything, check it still recognizes both voices here
+# 4. before teaching the store anything, check it still recognizes both voices here
 uv run python -m video_transcribe.voiceprint validate meeting.json meeting.mp4 --store voiceprints.json --names "Mar"
 uv run python -m video_transcribe.voiceprint validate meeting.json meeting.m4a --store voiceprints.json --names "Sharad"
 
-# 4. exit code 0 or 1 from step 3 (not 2) -> safe to enroll
+# 5. exit code 0 or 1 from step 4 (not 2) -> safe to enroll
 uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.mp4 --store voiceprints.json --names "Mar"
 uv run python -m video_transcribe.voiceprint enroll meeting.json meeting.m4a --store voiceprints.json --names "Sharad"
 ```
@@ -365,13 +409,21 @@ uv run video-transcribe meeting.mp4 meeting.m4a --diarize-track 0 --speakers 4 \
   --track-speakers "Sharad" --voiceprints voiceprints.json \
   --hotwords-file glossary.json --mux -f txt -f srt -f json
 
-# 2. glossary corrections (same as above)
+# 2. check for repetition loops / drift, and read the visual-ID findings
+uv run video-transcribe-qc meeting.json
+uv run python -m video_transcribe.visual_id review meeting.visual.json --transcript meeting.json
+
+# 3. glossary corrections (same as above)
 uv run python -m video_transcribe.correct meeting.json --glossary glossary.json -f txt -f srt -f json
 
-# 3. READ the transcript; confirm every auto-assigned name against what was actually said.
+# 4. READ the transcript; confirm every auto-assigned name against what was actually said.
 #    If anyone stayed generic ("Speaker N"), rename with correct.py --speakers "Speaker 1=Name,..."
+#    If a label was flagged merge_suspected, split it with --speaker-at "<start>=Name"
+#    (step 2 prints the exact command). Check the names first — Meet's speaker
+#    highlight lingers, so a reading right after a speaker change can name the
+#    previous person.
 
-# 4. only after confirming names by hand, enroll each one (mic name from meeting.m4a, rest from meeting.mp4)
+# 5. only after confirming names by hand, enroll each one (mic name from meeting.m4a, rest from meeting.mp4)
 uv run python -m video_transcribe.voiceprint validate meeting.json meeting.mp4 --store voiceprints.json --names "Ryan,Mar,Ness,John"
 uv run python -m video_transcribe.voiceprint enroll   meeting.json meeting.mp4 --store voiceprints.json --names "Ryan,Mar,Ness,John"
 ```

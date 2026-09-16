@@ -803,6 +803,99 @@ def build_report(transcript: dict, media: Path, readings: list[VisualReading], p
     }
 
 
+def _review(report_path: Path, transcript_path: Path | None) -> int:
+    """Print a human-readable summary of a .visual.json plus the exact fix command.
+
+    A merge_suspected finding is deliberately never auto-applied (see
+    check_label_consistency), so the last mile has always been a person reading
+    the report and deciding who actually spoke. This prints that report in the
+    order a person needs it -- flagged labels first, with each flagged
+    utterance's timestamp and text -- and ends with a ready-to-edit
+    ``correct.py --speaker-at`` line, which is the command that applies the
+    decision.
+    """
+    if not report_path.exists():
+        print(f"error: report not found: {report_path}", file=sys.stderr)
+        return 2
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    utterance_text: dict[float, tuple[str, str]] = {}
+    if transcript_path and transcript_path.exists():
+        data = json.loads(transcript_path.read_text(encoding="utf-8"))
+        for u in data.get("utterances", []):
+            utterance_text[round(float(u.get("start", 0.0)), 2)] = (
+                u.get("speaker") or "", u.get("text", ""))
+
+    overall = report.get("overall", {})
+    print(f"{report_path.name}")
+    print(f"  {overall.get('n_visually_read', 0)}/{overall.get('n_utterances', 0)} "
+          f"utterances visually identified")
+
+    flagged = report.get("merge_suspected", [])
+    summary = report.get("label_summary", {})
+
+    if flagged:
+        print("\nMERGE SUSPECTED -- one diarized label, more than one person:")
+    for entry in flagged:
+        label = entry["label"]
+        names = entry.get("names", {})
+        parts = ", ".join(
+            f"{n} ({d.get('utterances', 0)} utt, {d.get('duration', 0.0):.0f}s)"
+            for n, d in sorted(names.items(),
+                               key=lambda kv: -kv[1].get("utterances", 0)))
+        print(f"  {label!r} -> {parts}")
+        # Show the minority readings -- those are the utterances a human has to
+        # judge, and they are what a --speaker-at override will target.
+        majority = max(names.items(), key=lambda kv: kv[1].get("utterances", 0))[0] \
+            if names else None
+        for r in report.get("readings", []):
+            if r.get("label") != label or not r.get("name") or r["name"] == majority:
+                continue
+            start = round(float(r.get("utterance_start", 0.0)), 2)
+            spoken = utterance_text.get(start, ("", ""))[1]
+            snippet = f"  {spoken[:70]!r}" if spoken else ""
+            print(f"    reads as {r['name']!r} at {start:.2f}s "
+                  f"(conf {r.get('confidence', 0):.2f}, "
+                  f"{r.get('n_accepted', 0)}/{r.get('n_samples', 0)} samples){snippet}")
+
+    unresolved = report.get("unresolved_labels", [])
+    if unresolved:
+        print(f"\nStill generic (no confident visual name): {', '.join(unresolved)}")
+
+    named = {lab: list(v.get("visual_names", {})) for lab, v in summary.items()
+             if v.get("visual_names") and not v.get("merge_suspected")}
+    if named:
+        print("\nLabels with a single consistent visual reading:")
+        for lab, names in named.items():
+            # A still-generic "Speaker N" reading as a real name is the
+            # auto-naming path working as intended. A label that already has a
+            # real name (voiceprint match, --track-speakers ground truth)
+            # reading as somebody else is the case worth a second look -- it is
+            # never acted on automatically.
+            mark = ""
+            if not is_generic_label(lab) and lab not in names:
+                mark = "   <- differs from the label's own name; not auto-applied"
+            print(f"  {lab!r} -> {', '.join(names)}{mark}")
+
+    if flagged:
+        target = transcript_path.name if transcript_path else "TRANSCRIPT.json"
+        first = flagged[0]
+        minority = [r for r in report.get("readings", [])
+                    if r.get("label") == first["label"] and r.get("name")
+                    and r["name"] != max(first.get("names", {}).items(),
+                                         key=lambda kv: kv[1].get("utterances", 0))[0]]
+        overrides = " ".join(
+            f'--speaker-at "{float(r["utterance_start"]):.2f}={r["name"]}"'
+            for r in minority[:4])
+        print("\nTo apply a split (edit the names first -- the visual reading can be "
+              "wrong, e.g. Meet's highlight lingers on the previous speaker):")
+        print(f"  uv run python -m video_transcribe.correct {target} {overrides}")
+        return 2
+
+    print("\nno merge_suspected labels -- nothing to split")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="video-transcribe-visual-id",
@@ -829,7 +922,21 @@ def main(argv: list[str] | None = None) -> int:
     detect_p.add_argument("-o", "--output", type=Path, default=None,
                           help="write the report JSON here (default: <transcript>.visual.json)")
 
+    review_p = sub.add_parser(
+        "review", help="Summarise an existing .visual.json: which labels are "
+                       "merge_suspected, what each label reads as visually, and "
+                       "the exact correct.py command to apply a split by hand.",
+    )
+    review_p.add_argument("report", type=Path, help="the .visual.json written by detect")
+    review_p.add_argument("--transcript", type=Path, default=None,
+                          help="matching transcript .json -- lets the suggested "
+                               "correct.py command name a real file and lets each "
+                               "flagged utterance be printed with its text")
+
     args = p.parse_args(argv)
+
+    if args.command == "review":
+        return _review(args.report, args.transcript)
 
     if args.command == "detect":
         roster = [n.strip() for n in (args.roster or "").split(",") if n.strip()]

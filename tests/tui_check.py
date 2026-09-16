@@ -125,6 +125,28 @@ def test_build_required_and_numeric_validation():
     print("[ok] build: required / integer / choice validation")
 
 
+def test_build_empty_valued_flag_and_conflicts():
+    # `--speakers ""` suppresses a glossary's default speaker map -- the fix for
+    # a stale map mislabeling someone. The empty string is the meaningful value,
+    # so it can't come from a text field (blank there means "unset").
+    task = CATALOG["correct"]
+    tokens = build_tokens(task, {"input": "m.json", "glossary": "g.json",
+                                 "suppress_speaker_map": True})
+    i = tokens.index("--speakers")
+    assert tokens[i + 1] == "", tokens
+
+    # Setting the toggle and the rename field together would emit --speakers
+    # twice and silently let one win; that must be refused up front.
+    try:
+        build_tokens(task, {"input": "m.json", "speakers": "Speaker 1=Noah",
+                            "suppress_speaker_map": True})
+    except ValidationError as e:
+        assert "suppress_speaker_map" in str(e)
+    else:
+        raise AssertionError("conflicting --speakers sources should raise")
+    print("[ok] build: empty-valued flag emitted, conflicting sources refused")
+
+
 def test_examples_valid():
     total = 0
     for key, task in CATALOG.items():
@@ -201,6 +223,8 @@ def test_tui_app_pilot():
 
     import asyncio
 
+    from textual.widgets import Button
+
     from video_transcribe.tui_catalog import CATALOG as _CAT
     from video_transcribe.tui_catalog import build_tokens as _build
     from video_transcribe.tui import TranscribeTUI
@@ -214,9 +238,13 @@ def test_tui_app_pilot():
             task = _CAT[app._selected]
             inputs = app.query("#arg-inputs")
             assert inputs, "form widgets did not mount"
-            # clicking an example's Load button fills the form; read it back
+            # Loading an example fills the form; read it back. Press the button
+            # directly rather than clicking at a screen offset: a task with a
+            # longer summary or more options pushes the button below the test
+            # terminal's 24 rows, and mouse geometry is Textual's concern, not
+            # this catalog's. The handler path exercised is the same.
             assert app.query("#ex-0"), "example Load button did not mount"
-            await pilot.click("#ex-0")
+            app.query_one("#ex-0", Button).press()
             await pilot.pause()
             loaded = _build(task, app._collect(task))
             expected = _build(task, dict(task.examples[0].values))
@@ -259,6 +287,7 @@ if __name__ == "__main__":
     test_build_changed_values_and_flags()
     test_build_prefix_flags_preserved()
     test_build_required_and_numeric_validation()
+    test_build_empty_valued_flag_and_conflicts()
     test_examples_valid()
     test_split_paths()
     test_demux_committed_lines_crlf()

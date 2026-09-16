@@ -65,6 +65,14 @@ class Arg:
     required: bool = False
     repeatable: bool = False
     placeholder: str = ""
+    # For a bool arg, emit ``[flag, value_when_true]`` instead of a bare flag.
+    # Exists for ``--speakers ""``, where the *empty string* is the meaningful
+    # value (it suppresses a glossary's default speaker map) and so cannot be
+    # typed into a text field -- a blank text field means "unset".
+    value_when_true: str | None = None
+    # Names of other args in the same task that must not be set at the same
+    # time as this one, checked in :func:`build_tokens`.
+    conflicts_with: tuple[str, ...] = ()
 
     @property
     def positional(self) -> bool:
@@ -151,7 +159,9 @@ def _positional_tokens(arg: Arg, raw: str) -> list[str]:
 def _flag_tokens(arg: Arg, value: str | bool) -> list[str]:
     assert arg.flag is not None  # positionals routed elsewhere
     if arg.kind == "bool":
-        return [arg.flag] if value else []
+        if not value:
+            return []
+        return [arg.flag] if arg.value_when_true is None else [arg.flag, arg.value_when_true]
     text = str(value).strip()
     if not text:
         if arg.required:
@@ -183,10 +193,24 @@ def build_tokens(task: Task, values: dict[str, str | bool]) -> list[str]:
     for the ``video-transcribe FILES...`` shape and for the subcommand shapes
     alike. Raises :class:`ValidationError` on the first bad field.
     """
+    def _is_set(name: str) -> bool:
+        arg = next((a for a in task.args if a.name == name), None)
+        if arg is None:
+            return False
+        raw = values.get(name, arg.default)
+        return bool(raw) if arg.kind == "bool" else bool(str(raw).strip())
+
     flags: list[str] = []
     positionals: list[str] = []
     for arg in task.args:
         raw = values.get(arg.name, arg.default)
+        if arg.conflicts_with and _is_set(arg.name):
+            clash = [n for n in arg.conflicts_with if _is_set(n)]
+            if clash:
+                raise ValidationError(
+                    f"{arg.name}: can't be combined with {', '.join(clash)} "
+                    f"-- they set the same flag"
+                )
         if arg.positional:
             positionals += _positional_tokens(arg, str(raw))
         else:
@@ -277,6 +301,18 @@ VISUAL_NAME_THRESHOLD = Arg("visual_name_threshold", "float",
 _COMMON_TAIL = (FORMAT, MODEL, LANGUAGE, DEVICE, COMPUTE, HOTWORDS, HOTWORDS_FILE,
                 OUTPUT_DIR, NO_VAD, NO_TIDY, NO_PUNCT, KEEP_AUDIO, VERBOSE, QUIET)
 
+# Shorter tail for the track-based modes, which don't expose device/compute.
+# HOTWORDS_FILE belongs here as much as in _COMMON_TAIL: in practice every
+# real multi-track run passes a glossary file to bias names, and leaving the
+# flag out of the form meant retyping the whole command by hand.
+_TRACK_TAIL = (FORMAT, MODEL, LANGUAGE, HOTWORDS, HOTWORDS_FILE, OUTPUT_DIR,
+               NO_TIDY, NO_PUNCT, VERBOSE, QUIET)
+
+MUX = Arg("mux", "bool", "Also write a combined .mkv (Mix + Desktop + Mic).", flag="--mux")
+TRACK_SPEAKERS = Arg("track_speakers", "str",
+                     "Speaker names, one per file, in the same order as the files.",
+                     flag="--track-speakers", required=True, placeholder="Mar,Sharad")
+
 
 # --------------------------------------------------------------------------- #
 # the catalog
@@ -284,6 +320,7 @@ _COMMON_TAIL = (FORMAT, MODEL, LANGUAGE, DEVICE, COMPUTE, HOTWORDS, HOTWORDS_FIL
 
 CATEGORY_ORDER = (
     "transcribe",   # everyday transcription jobs
+    "verify",       # checking a finished transcript before trusting it
     "speakers",     # speaker diarization & voiceprints
     "media",        # media manipulation (mux)
     "visual",       # visual speaker identification
@@ -293,6 +330,7 @@ CATEGORY_ORDER = (
 
 CATEGORY_LABELS = {
     "transcribe": "Transcribe",
+    "verify": "Check Transcript",
     "speakers": "Speaker Diarization",
     "media": "Media",
     "visual": "Visual ID",
@@ -303,6 +341,7 @@ CATEGORY_LABELS = {
 # Category sidebar colors for quick visual scanning.
 CATEGORY_COLORS: dict[str, str] = {
     "transcribe": "#7AE582",
+    "verify": "#FFB347",
     "speakers": "#E09BFF",
     "media": "#7AE0E5",
     "visual": "#FFD862",
@@ -312,7 +351,29 @@ CATEGORY_COLORS: dict[str, str] = {
 
 _TASKS: tuple[Task, ...] = (
     # ── Transcribe ──────────────────────────────────────────────────────
+    # Ordered by how often each one is actually run. The 1-1 sync at the top
+    # accounts for more runs than everything below it combined.
 
+    Task(
+        key="sync-1on1",
+        label="1-1 sync (video + own mic) — the usual run",
+        category="transcribe",
+        summary="ReLive video + your own mic file, merged by timestamp into one "
+                "exact two-speaker transcript. Pre-set to the combination every "
+                "biweekly sync uses: txt+srt+json, --mux, glossary hotwords, "
+                "streaming output. VIDEO first, MIC second — --track-speakers "
+                "names them in that order.",
+        argv_prefix=("-m", "video_transcribe"),
+        args=(
+            INPUTS, TRACK_SPEAKERS,
+            replace(MUX, default=True),
+            replace(FORMAT, default="txt,srt,json"),
+            HOTWORDS_FILE,
+            replace(VERBOSE, default=True),
+            MODEL, LANGUAGE, HOTWORDS, OUTPUT_DIR, NO_TIDY, NO_PUNCT, QUIET,
+        ),
+        tags=("transcribe", "tracks", "mux", "1-1", "sync", "relive", "everyday"),
+    ),
     Task(
         key="transcribe",
         label="Transcribe — basic",
@@ -357,6 +418,65 @@ _TASKS: tuple[Task, ...] = (
         argv_prefix=("-m", "video_transcribe"),
         args=(INPUTS, *_COMMON_TAIL),
         tags=("transcribe", "english", "whisper"),
+    ),
+
+    # ── Check Transcript ────────────────────────────────────────────────
+    # Run after almost every transcription -- second only to the 1-1 sync
+    # itself. Whisper's failure modes on real meeting audio are quiet: the
+    # text stays fluent and plausible while repeating or drifting, so a
+    # transcript that reads fine can still be wrong.
+
+    Task(
+        key="qc",
+        label="Check transcript for hallucinations",
+        category="verify",
+        summary="Scan a finished transcript .json for Whisper's known failure "
+                "modes: verbatim repetition loops, non-English drift, segments "
+                "holding more words than their own duration allows, unsplit VAD "
+                "segments, and duplicate speaker names. Findings are split into "
+                "REVIEW (text is probably corrupted) and info (odd timing on "
+                "text that is probably fine) -- impossible speed alone is not "
+                "treated as proof, it has to come with repetition. Read-only; "
+                "exits non-zero when something needs review.",
+        argv_prefix=("-m", "video_transcribe.qc"),
+        args=(
+            Arg("transcripts", "paths", "Transcript .json file(s) -- one per line.",
+                placeholder="C:\\clips\\meeting.json"),
+            Arg("glob", "str", "Also scan every .json matching this pattern.",
+                flag="--glob", placeholder="C:\\clips\\*.json"),
+            Arg("max_words_per_sec", "float", "Flag segments faster than this.",
+                flag="--max-words-per-sec", default="15.0"),
+            Arg("long_segment", "float", "Report segments longer than this (seconds).",
+                flag="--long-segment", default="60.0"),
+            Arg("min_repeats", "int", "Consecutive repeats before flagging.",
+                flag="--min-repeats", default="3"),
+            Arg("as_json", "bool", "Emit findings as JSON instead of a report.", flag="--json"),
+            Arg("quiet", "bool", "Only print files that have findings needing review.",
+                flag="--quiet"),
+        ),
+        tags=("verify", "qc", "hallucination", "repetition", "check", "quality"),
+    ),
+    Task(
+        key="visual-review",
+        label="Review visual-ID report (merge_suspected)",
+        category="verify",
+        summary="Summarise an existing .visual.json: which diarized labels are "
+                "merge_suspected (one label, more than one person), what each "
+                "label reads as visually, and which labels stayed generic. Ends "
+                "with a ready-to-edit correct.py --speaker-at command that "
+                "applies your decision. A flagged label is never split "
+                "automatically, so this is the step between detection and fix. "
+                "Check the names before running the suggested command -- Meet's "
+                "active-speaker highlight lingers, so a short utterance right "
+                "after a speaker change can read as the previous person.",
+        argv_prefix=("-m", "video_transcribe.visual_id", "review"),
+        args=(
+            Arg("report", "path", "The .visual.json written by a --visual-id run.",
+                required=True),
+            Arg("transcript", "path", "Matching transcript .json (shows each flagged "
+                                      "utterance's text).", flag="--transcript"),
+        ),
+        tags=("verify", "visual", "merge", "review", "speakers"),
     ),
 
     # ── Speaker Diarization ─────────────────────────────────────────────
@@ -412,7 +532,7 @@ _TASKS: tuple[Task, ...] = (
             INPUTS,
             Arg("tracks", "str", "Track → speaker map: '0=Mar,1=Sharad'.", flag="--tracks",
                 required=True, placeholder="0=Mar,1=Sharad"),
-            FORMAT, MODEL, LANGUAGE, HOTWORDS, OUTPUT_DIR, NO_TIDY, NO_PUNCT, VERBOSE, QUIET,
+            *_TRACK_TAIL,
         ),
         tags=("transcribe", "tracks", "speakers", "relive"),
     ),
@@ -424,13 +544,7 @@ _TASKS: tuple[Task, ...] = (
                 "transcribe each and merge by timestamp, labeled by "
                 "--track-speakers. Also supports --mux to write a combined .mkv.",
         argv_prefix=("-m", "video_transcribe"),
-        args=(
-            INPUTS,
-            Arg("track_speakers", "str", "Speaker names, one per file (comma-separated).",
-                flag="--track-speakers", required=True, placeholder="Mar,Sharad"),
-            Arg("mux", "bool", "Also write a combined .mkv (Mix + Desktop + Mic).", flag="--mux"),
-            FORMAT, MODEL, LANGUAGE, HOTWORDS, OUTPUT_DIR, NO_TIDY, NO_PUNCT, VERBOSE, QUIET,
-        ),
+        args=(INPUTS, TRACK_SPEAKERS, MUX, *_TRACK_TAIL),
         tags=("transcribe", "tracks", "mux", "speakers", "relive"),
     ),
     Task(
@@ -440,19 +554,21 @@ _TASKS: tuple[Task, ...] = (
         summary="Group call + your own mic: acoustically diarize one input "
                 "(--diarize-track) while other files are fixed single-speaker "
                 "tracks. Best of both worlds for meetings where you have a "
-                "separate mic but the video has multiple voices.",
+                "separate mic but the video has multiple voices. Layer on "
+                "voiceprints to auto-name known voices and --visual-id to catch "
+                "a cluster that merged two people -- that combination is what "
+                "the team engineering meetings use.",
         argv_prefix=("-m", "video_transcribe"),
         args=(
             INPUTS,
             Arg("diarize_track", "int", "0-based index of the file to diarize.",
                 flag="--diarize-track", required=True, placeholder="0"),
-            Arg("track_speakers", "str", "Names for the OTHER (non-diarized) files.",
-                flag="--track-speakers", required=True, placeholder="Sharad"),
+            replace(TRACK_SPEAKERS, help="Names for the OTHER (non-diarized) files.",
+                    placeholder="Sharad"),
             SPEAKERS, MIN_SPK, MAX_SPK, HF_TOKEN, VOICEPRINTS, VOICE_THRESHOLD,
-            Arg("mux", "bool", "Also write a combined .mkv.", flag="--mux"),
-            FORMAT, MODEL, LANGUAGE, HOTWORDS, OUTPUT_DIR, NO_TIDY, NO_PUNCT, VERBOSE, QUIET,
+            VISUAL_ID, VISUAL_ROSTER, VISUAL_REPORT, MUX, *_TRACK_TAIL,
         ),
-        tags=("transcribe", "diarize", "tracks", "hybrid", "speakers"),
+        tags=("transcribe", "diarize", "tracks", "hybrid", "speakers", "visual"),
     ),
 
     # ── Media ───────────────────────────────────────────────────────────
@@ -482,8 +598,15 @@ _TASKS: tuple[Task, ...] = (
         category="visual",
         summary="OCR the active-speaker-highlighted tile's name label in a "
                 "Google Meet gallery-view recording to auto-name diarized "
-                "speakers. Fully local (EasyOCR) — no external API calls. "
-                "Best combined with --diarize for full speaker labeling.",
+                "speakers, and flag any label whose utterances resolve to more "
+                "than one person. Fully local (EasyOCR) — no external API "
+                "calls. Only ever fills in still-generic 'Speaker N' labels; a "
+                "name already set by voiceprints or a fixed track is never "
+                "overwritten, and a merge_suspected label is never split "
+                "automatically. Works on gallery-view screen recordings; a "
+                "Meet cloud recording in speaker view has no tile borders to "
+                "read and will find nothing. Follow up with 'Review visual-ID "
+                "report'.",
         argv_prefix=("-m", "video_transcribe", "--diarize", "--visual-id"),
         args=(
             INPUTS,
@@ -501,37 +624,62 @@ _TASKS: tuple[Task, ...] = (
         key="correct",
         label="Correct — glossary (local, no LLM)",
         category="correct",
-        summary="Apply a glossary (term fixes + speaker names) to a finished "
-                "transcript .json. Fully local and deterministic — no re-"
-                "transcription, no external API. Re-emits txt/srt/vtt/json.",
+        summary="Apply fixes to a finished transcript .json: glossary term "
+                "corrections, whole-label speaker renames, per-utterance "
+                "speaker overrides, and one-off text fixes -- in any "
+                "combination, in one pass. Fully local and deterministic: no "
+                "re-transcription, no external API. Every field is optional "
+                "except the transcript, so this is also how you simply re-emit "
+                "txt/srt/vtt/json from an edited .json.",
         argv_prefix=("-m", "video_transcribe.correct"),
         args=(
             Arg("input", "path", "Transcript .json from video-transcribe.", required=True),
-            Arg("glossary", "path", "Glossary JSON (speaker_map + corrections).", flag="--glossary",
-                required=True),
-            Arg("speakers", "str", "Override speaker map for this run.", flag="--speakers"),
+            Arg("glossary", "path", "Glossary JSON (speaker_map + corrections). Optional.",
+                flag="--glossary"),
+            Arg("speakers", "str", "Whole-label renames: 'Speaker 1=Noah,Speaker 2=Mark'.",
+                flag="--speakers", placeholder="Speaker 1=Noah,Speaker 2=Mark",
+                conflicts_with=("suppress_speaker_map",)),
+            Arg("suppress_speaker_map", "bool",
+                "Ignore the glossary's built-in speaker_map entirely (sends --speakers \"\"). "
+                "Use when the transcript's names are already correct and a stale default "
+                "map meant for a different meeting would overwrite them.",
+                flag="--speakers", value_when_true="",
+                conflicts_with=("speakers",)),
+            Arg("speaker_at", "str", "Per-utterance override by start time (repeatable).",
+                flag="--speaker-at", repeatable=True, placeholder="37.3=Sharad"),
+            Arg("correction", "str", "One-off text fix FROM=TO (repeatable).",
+                flag="--correction", repeatable=True, placeholder="Pral=Carolyn"),
             OUTPUT_DIR,
             Arg("format", "str", "Output formats (default: txt,srt,json).", flag="--format",
                 choices=_FMT_CHOICES, repeatable=True, placeholder="txt,srt,json"),
         ),
-        tags=("correct", "glossary", "local", "post-process"),
+        tags=("correct", "glossary", "speakers", "local", "post-process"),
     ),
     Task(
         key="correct-speaker-at",
-        label="Correct — speaker at time range",
+        label="Correct — split a merged speaker label",
         category="correct",
-        summary="Override ONE utterance's speaker by its start time. This is "
-                "the fix for a visual_id.py merge_suspected finding: when "
-                "diarization merged two people into one label, use this to "
-                "assign a specific time range to someone else.",
+        summary="Reassign ONE utterance to a different speaker by its start "
+                "time, leaving every other utterance under that label alone. "
+                "This is how a visual-ID merge_suspected finding gets fixed: "
+                "diarization put two people in one cluster, and only you can "
+                "say which utterance belongs to whom. Get the timestamps from "
+                "'Review visual-ID report', and sanity-check them first -- "
+                "Meet's speaker highlight lingers, so the visual reading right "
+                "after a speaker change can name the previous person.",
         argv_prefix=("-m", "video_transcribe.correct"),
         args=(
             Arg("input", "path", "Transcript .json from video-transcribe.", required=True),
             Arg("speaker_at", "str", "Time=Name overrides (repeatable), e.g. '37.3=Sharad'.",
-                flag="--speaker-at", repeatable=True, placeholder="37.3=Sharad"),
+                flag="--speaker-at", repeatable=True, required=True,
+                placeholder="37.3=Sharad"),
+            Arg("glossary", "path", "Glossary JSON, if you also want term fixes.",
+                flag="--glossary"),
             OUTPUT_DIR,
+            Arg("format", "str", "Output formats (default: txt,srt,json).", flag="--format",
+                choices=_FMT_CHOICES, repeatable=True, placeholder="txt,srt,json"),
         ),
-        tags=("correct", "speaker", "time-range", "local"),
+        tags=("correct", "speaker", "merge", "split", "local"),
     ),
     Task(
         key="llm-correct",
@@ -628,6 +776,31 @@ _TASKS: tuple[Task, ...] = (
 # passes, Google Meet recordings, etc. File names are placeholders; edit the
 # paths in the form before running.
 _EXAMPLES: dict[str, tuple[Example, ...]] = {
+    "sync-1on1": (
+        Example("Biweekly 1-1: ReLive video + own mic, muxed, glossary hotwords",
+                {"inputs": "LAB.Mar.BiweeklySync.Sync14.mp4\nLAB.Mar.BiweeklySync.Sync14.m4a",
+                 "track_speakers": "Mar,Sharad",
+                 "hotwords_file": "transcript-glossary.json"}),
+        Example("Playtest call with a different person on the far end",
+                {"inputs": "LAB.LoomCradle.Playtest.JV.mp4\nLAB.LoomCradle.Playtest.JV.m4a",
+                 "track_speakers": "JV,Sharad",
+                 "hotwords_file": "transcript-glossary.json"}),
+        Example("Transcript only -- skip the .mkv (it already exists from an earlier run)",
+                {"inputs": "sync.mp4\nsync.m4a", "track_speakers": "Mar,Sharad",
+                 "mux": False}),
+    ),
+    "qc": (
+        Example("Check the transcript you just produced",
+                {"transcripts": "meeting.json"}),
+        Example("Sweep every past transcript in a folder, listing only real problems",
+                {"glob": "C:\\Users\\me\\Videos\\*.json", "quiet": True}),
+        Example("Machine-readable findings for a script to consume",
+                {"transcripts": "meeting.json", "as_json": True}),
+    ),
+    "visual-review": (
+        Example("Read the merge_suspected findings and get the fix command",
+                {"report": "meeting.visual.json", "transcript": "meeting.json"}),
+    ),
     "transcribe": (
         Example("Highest quality (large-v3); transcript beside the input",
                 {"inputs": "talk.mp4"}),
@@ -685,6 +858,13 @@ _EXAMPLES: dict[str, tuple[Example, ...]] = {
         Example("Group call (diarize file 0) + your own separate mic",
                 {"inputs": "meeting.mp4\nmeeting.m4a", "diarize_track": "0",
                  "speakers": "4", "track_speakers": "Sharad"}),
+        Example("Team engineering meeting: diarize + voiceprints + visual ID + mux",
+                {"inputs": "LAB.EngineeringMeeting.mp4\nLAB.EngineeringMeeting.m4a",
+                 "diarize_track": "0", "track_speakers": "Sharad",
+                 "voiceprints": "voiceprints.json", "voice_threshold": "0.75",
+                 "visual_id": True,
+                 "visual_roster": "Ryan,Mar,Ness,John,Sharad,Carolyn,Fabricio,Jacob,Noah",
+                 "mux": True, "hotwords_file": "transcript-glossary.json"}),
     ),
     "mux": (
         Example("Merge video + separate mic into one playable .mkv",
@@ -694,17 +874,29 @@ _EXAMPLES: dict[str, tuple[Example, ...]] = {
         Example("Google Meet gallery-view: OCR name labels + diarize",
                 {"inputs": "google-meet.mp4", "speakers": "5",
                  "visual_roster": "Mar,Sharad,Ryan,Ness,John"}),
+        Example("Team meeting: voiceprints for known voices, visual ID for the rest",
+                {"inputs": "LabradorTeamMeeting.mp4",
+                 "voiceprints": "voiceprints.json", "voice_threshold": "0.75",
+                 "visual_roster": "Ryan,Mar,Ness,John,Sharad,Carolyn,Noah,Jacob",
+                 "hotwords_file": "transcript-glossary.json"}),
     ),
     "correct": (
         Example("Apply glossary term fixes + speaker names to a transcript",
                 {"input": "meeting.json", "glossary": "g.json"}),
-        Example("Override just the speaker names for this run",
+        Example("Name the speakers diarization left generic",
+                {"input": "meeting.json",
+                 "speakers": "Speaker 1=Noah,Speaker 2=Mark,Speaker 3=Will"}),
+        Example("One-off fixes this recording only, no glossary edit",
+                {"input": "meeting.json", "correction": "Pral=Carolyn"}),
+        Example("Suppress a stale glossary speaker_map, keep its term fixes",
                 {"input": "meeting.json", "glossary": "g.json",
-                 "speakers": "Speaker 1=JV,Speaker 2=Sharad"}),
+                 "suppress_speaker_map": True}),
     ),
     "correct-speaker-at": (
-        Example("Fix a merge error: assign utterance at 37.3s to Sharad",
+        Example("Split a merged label: the 37.3s utterance was actually Sharad",
                 {"input": "meeting.json", "speaker_at": "37.3=Sharad"}),
+        Example("Several utterances at once, from the visual-ID review output",
+                {"input": "meeting.json", "speaker_at": "1904.28=Carolyn,2269.98=Carolyn"}),
     ),
     "llm-correct": (
         Example("Claude fixes misheard names/jargon, using a glossary for context",
