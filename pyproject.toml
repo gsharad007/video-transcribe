@@ -54,6 +54,7 @@ tui = [
 video-transcribe = "video_transcribe.cli:main"
 video-transcribe-tui = "video_transcribe.tui:main"
 video-transcribe-qc = "video_transcribe.qc:main"
+video-transcribe-run = "video_transcribe.pipeline:main"
 
 [build-system]
 requires = ["hatchling"]

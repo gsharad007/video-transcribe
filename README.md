@@ -370,6 +370,40 @@ Known gap: a loop that paraphrases rather than repeating verbatim (same idea,
 slightly different words each time) is only caught when the rate is also
 impossible. Those show up as `info` rather than `REVIEW`.
 
+## One command for the whole job
+
+`video-transcribe-run` chains everything below — transcribe, glossary pass,
+hallucination check, visual-ID review for group calls, and an optional Claude
+review of your notes — and writes one `<name>.report.md`:
+
+```pwsh
+# 1-1: local steps only
+uv run video-transcribe-run 1on1 sync.mp4 sync.m4a --them Mar
+
+# + LLM review: notes coverage, suspected mis-hearings, QC verdicts (sends text to Anthropic)
+uv run video-transcribe-run 1on1 sync.mp4 sync.m4a --them Mar --llm --notes notes.txt
+
+# + apply the review's high-confidence fixes, each limited to the utterance it came from
+uv run video-transcribe-run 1on1 sync.mp4 sync.m4a --them Mar --llm --notes notes.txt --apply-llm-fixes
+
+# group call + own mic, one-file group recording, or just re-check an existing transcript
+uv run video-transcribe-run group-hybrid meeting.mp4 meeting.m4a
+uv run video-transcribe-run group-meet recording.mp4 --speakers 5
+uv run video-transcribe-run check meeting.json --llm --notes-text "* topic one * topic two"
+```
+
+Defaults come from `~/.video-transcribe/config.json`:
+
+```json
+{"me": "Sharad", "glossary": "...\\transcript-glossary.json",
+ "voiceprints": "...\\voiceprints.json", "voice_threshold": 0.75,
+ "roster": ["Mar", "Ness", "..."], "llm_model": "claude-opus-5-5"}
+```
+
+The LLM step is off unless `--llm` is passed, and its fixes are proposals unless
+`--apply-llm-fixes` is passed. Exit code: 0 clean, 1 something needs review, 2
+failed. Each preset is also a task in the TUI.
+
 ## Full workflow, start to finish
 
 Putting the pieces above together — this is the whole recurring loop as one

@@ -233,8 +233,11 @@ def test_tui_app_pilot():
         app = TranscribeTUI()
         async with app.run_test() as pilot:
             await pilot.pause()
-            # a task is auto-selected and its option widgets are mounted
+            # a task is auto-selected; then pin a known one so the checks below
+            # don't depend on which task the catalog orders first
             assert app._selected is not None
+            await app._select_task("transcribe")
+            await pilot.pause()
             task = _CAT[app._selected]
             inputs = app.query("#arg-inputs")
             assert inputs, "form widgets did not mount"

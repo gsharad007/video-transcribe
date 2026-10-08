@@ -308,6 +308,21 @@ _COMMON_TAIL = (FORMAT, MODEL, LANGUAGE, DEVICE, COMPUTE, HOTWORDS, HOTWORDS_FIL
 _TRACK_TAIL = (FORMAT, MODEL, LANGUAGE, HOTWORDS, HOTWORDS_FILE, OUTPUT_DIR,
                NO_TIDY, NO_PUNCT, VERBOSE, QUIET)
 
+# Shared by the all-in-one pipeline presets (video_transcribe.pipeline).
+_PIPELINE_TAIL = (
+    Arg("notes_text", "str", "Your meeting notes (paste the bullets; checked only with LLM review).",
+        flag="--notes-text", placeholder="* talked about APT/Horde * Ness may need help with shadows"),
+    Arg("notes", "path", "...or a notes text file.", flag="--notes"),
+    Arg("llm", "bool", "LLM review: notes coverage, mis-hearings, QC verdicts. "
+                       "Sends transcript + notes to Anthropic.", flag="--llm"),
+    Arg("apply_llm_fixes", "bool", "Apply the review's high-confidence fixes (each limited "
+                                   "to its own utterance). Needs LLM review.",
+        flag="--apply-llm-fixes"),
+    Arg("glossary", "path", "Override the config file's glossary.", flag="--glossary"),
+    Arg("config", "path", "Config file (default ~/.video-transcribe/config.json).",
+        flag="--config"),
+)
+
 MUX = Arg("mux", "bool", "Also write a combined .mkv (Mix + Desktop + Mic).", flag="--mux")
 TRACK_SPEAKERS = Arg("track_speakers", "str",
                      "Speaker names, one per file, in the same order as the files.",
@@ -354,6 +369,26 @@ _TASKS: tuple[Task, ...] = (
     # Ordered by how often each one is actually run. The 1-1 sync at the top
     # accounts for more runs than everything below it combined.
 
+    Task(
+        key="run-1on1",
+        label="1-1 sync — all steps (transcribe → clean → check → review)",
+        category="transcribe",
+        summary="The whole recurring job in one run: transcribe video + your mic, "
+                "glossary pass, hallucination check, and -- with LLM review on -- "
+                "your notes checked against the transcript and mis-hearings "
+                "proposed. Writes <name>.report.md. Paths, glossary and your name "
+                "come from ~/.video-transcribe/config.json.",
+        argv_prefix=("-m", "video_transcribe.pipeline", "1on1"),
+        args=(
+            Arg("video", "path", "Screen recording (the other person's audio).", required=True),
+            Arg("mic", "path", "Your separate mic file.", required=True),
+            Arg("them", "str", "The other person's name.", flag="--them", required=True,
+                placeholder="Mar"),
+            *_PIPELINE_TAIL,
+            Arg("no_mux", "bool", "Skip writing the combined .mkv.", flag="--no-mux"),
+        ),
+        tags=("pipeline", "1-1", "sync", "everyday", "llm", "notes", "all-in-one"),
+    ),
     Task(
         key="sync-1on1",
         label="1-1 sync (video + own mic) — the usual run",
@@ -427,6 +462,21 @@ _TASKS: tuple[Task, ...] = (
     # transcript that reads fine can still be wrong.
 
     Task(
+        key="run-check",
+        label="Check an existing transcript — all steps",
+        category="verify",
+        summary="Run every post-transcription step on a .json you already have: "
+                "glossary pass, hallucination check, visual-ID review if a "
+                ".visual.json sits beside it, and optional LLM review against "
+                "your notes. No re-transcription. Writes <name>.report.md.",
+        argv_prefix=("-m", "video_transcribe.pipeline", "check"),
+        args=(
+            Arg("transcript", "path", "Transcript .json (or its .txt).", required=True),
+            *_PIPELINE_TAIL,
+        ),
+        tags=("pipeline", "verify", "check", "llm", "notes", "all-in-one"),
+    ),
+    Task(
         key="qc",
         label="Check transcript for hallucinations",
         category="verify",
@@ -481,6 +531,42 @@ _TASKS: tuple[Task, ...] = (
 
     # ── Speaker Diarization ─────────────────────────────────────────────
 
+    Task(
+        key="run-group-hybrid",
+        label="Group call + own mic — all steps",
+        category="speakers",
+        summary="Team-meeting job in one run: diarize the call video, keep your "
+                "mic exact, auto-name voices from the voiceprint store, visual-ID "
+                "to catch merged speakers, then glossary pass, hallucination "
+                "check, visual-ID review, and optional LLM review. Store, roster "
+                "and glossary come from the config file.",
+        argv_prefix=("-m", "video_transcribe.pipeline", "group-hybrid"),
+        args=(
+            Arg("video", "path", "Call recording (several voices).", required=True),
+            Arg("mic", "path", "Your separate mic file.", required=True),
+            SPEAKERS,
+            Arg("roster", "str", "Override the config roster for visual ID.", flag="--roster"),
+            *_PIPELINE_TAIL,
+            Arg("no_mux", "bool", "Skip writing the combined .mkv.", flag="--no-mux"),
+        ),
+        tags=("pipeline", "group", "hybrid", "diarize", "visual", "llm", "all-in-one"),
+    ),
+    Task(
+        key="run-group-meet",
+        label="Group recording (one file) — all steps",
+        category="speakers",
+        summary="One recording with several people (e.g. a Meet recording): "
+                "diarize, voiceprints, visual ID, then glossary pass, "
+                "hallucination check, visual-ID review, and optional LLM review.",
+        argv_prefix=("-m", "video_transcribe.pipeline", "group-meet"),
+        args=(
+            Arg("video", "path", "The recording.", required=True),
+            SPEAKERS,
+            Arg("roster", "str", "Override the config roster for visual ID.", flag="--roster"),
+            *_PIPELINE_TAIL,
+        ),
+        tags=("pipeline", "group", "diarize", "visual", "meet", "llm", "all-in-one"),
+    ),
     Task(
         key="diarize",
         label="Transcribe + diarize speakers",
@@ -776,6 +862,34 @@ _TASKS: tuple[Task, ...] = (
 # passes, Google Meet recordings, etc. File names are placeholders; edit the
 # paths in the form before running.
 _EXAMPLES: dict[str, tuple[Example, ...]] = {
+    "run-1on1": (
+        Example("Biweekly 1-1, local steps only (nothing leaves the machine)",
+                {"video": "LAB.Mar.BiweeklySync17.mp4", "mic": "LAB.Mar.BiweeklySync17.m4a",
+                 "them": "Mar"}),
+        Example("...plus LLM review of your notes; fixes proposed, not applied",
+                {"video": "LAB.Mar.BiweeklySync17.mp4", "mic": "LAB.Mar.BiweeklySync17.m4a",
+                 "them": "Mar", "llm": True,
+                 "notes_text": "* APT/Horde investigation * reviewing Jacob's shelf"}),
+        Example("...and apply the high-confidence fixes",
+                {"video": "LAB.Mar.BiweeklySync17.mp4", "mic": "LAB.Mar.BiweeklySync17.m4a",
+                 "them": "Mar", "llm": True, "apply_llm_fixes": True,
+                 "notes": "sync17-notes.txt"}),
+    ),
+    "run-check": (
+        Example("Re-check a transcript you already have",
+                {"transcript": "LAB.Mar.BiweeklySync16.json"}),
+        Example("...with LLM review against your notes",
+                {"transcript": "LAB.Mar.BiweeklySync16.json", "llm": True,
+                 "notes_text": "* volumetric fog * Ness colored shadows"}),
+    ),
+    "run-group-hybrid": (
+        Example("Engineering meeting: call video + own mic",
+                {"video": "LAB.EngineeringMeeting.mp4", "mic": "LAB.EngineeringMeeting.m4a"}),
+    ),
+    "run-group-meet": (
+        Example("Team meeting recording, 5 people",
+                {"video": "LabradorTeamMeeting.mp4", "speakers": "5"}),
+    ),
     "sync-1on1": (
         Example("Biweekly 1-1: ReLive video + own mic, muxed, glossary hotwords",
                 {"inputs": "LAB.Mar.BiweeklySync.Sync14.mp4\nLAB.Mar.BiweeklySync.Sync14.m4a",

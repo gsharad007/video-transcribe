@@ -615,6 +615,152 @@ def test_qc_clean_transcript_has_no_review_findings():
     print("[ok] qc: a clean transcript produces no review-level findings")
 
 
+def test_pipeline_transcribe_argv():
+    import argparse
+    from pathlib import Path
+    from video_transcribe.pipeline import Settings, transcribe_argv
+
+    s = Settings(me="Sharad", glossary=Path("g.json"), voiceprints=Path("vp.json"),
+                 voice_threshold=0.75, roster=["Mar", "Noah"])
+    one = argparse.Namespace(video=Path("v.mp4"), mic=Path("m.m4a"), them="Mar", no_mux=False)
+    # The exact shape run by hand for every biweekly sync.
+    assert transcribe_argv("1on1", one, s) == [
+        "v.mp4", "m.m4a", "--track-speakers", "Mar,Sharad", "--mux",
+        "--hotwords-file", "g.json", "-f", "txt", "-f", "srt", "-f", "json"]
+
+    hyb = argparse.Namespace(video=Path("v.mp4"), mic=Path("m.m4a"), speakers=None, no_mux=False)
+    argv = transcribe_argv("group-hybrid", hyb, s)
+    assert argv[:6] == ["v.mp4", "m.m4a", "--diarize-track", "0", "--track-speakers", "Sharad"]
+    assert "--visual-id" in argv and argv[argv.index("--visual-roster") + 1] == "Mar,Noah"
+    assert argv[argv.index("--voice-threshold") + 1] == "0.75"
+
+    meet = argparse.Namespace(video=Path("v.mp4"), speakers=5)
+    argv = transcribe_argv("group-meet", meet, s)
+    assert argv[:2] == ["v.mp4", "--diarize"] and argv[argv.index("--speakers") + 1] == "5"
+    assert "--mux" not in argv  # single file: nothing to mux
+    print("[ok] pipeline: preset argv matches the hand-run commands")
+
+
+def _fake_fix(i, frm, to, conf="high"):
+    from types import SimpleNamespace
+    return SimpleNamespace(utterance_index=i, from_text=frm, to_text=to,
+                           reason="context", confidence=conf)
+
+
+def test_pipeline_apply_fixes_scoped():
+    from video_transcribe.pipeline import apply_fixes
+
+    data = {
+        "utterances": [
+            {"start": 0.0, "end": 5.0, "speaker": "Mar", "text": "My Android phone is fine."},
+            {"start": 5.0, "end": 9.0, "speaker": "Sharad",
+             "text": "Satisfied with what Android provides right now."},
+        ],
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 5.0, "speaker": "Mar", "text": "My Android phone is fine."},
+            {"id": 1, "start": 5.0, "end": 9.0, "speaker": "Sharad",
+             "text": "Satisfied with what Android provides right now."},
+        ],
+    }
+    log = apply_fixes(data, [
+        _fake_fix(1, "Android", "Unreal"),            # applied, this utterance only
+        _fake_fix(0, "phone", "device", "medium"),    # below threshold: suggestion only
+        _fake_fix(1, "Horde", "Hoard"),               # text not in utterance: skipped
+    ])
+    assert data["utterances"][1]["text"] == "Satisfied with what Unreal provides right now."
+    assert data["segments"][1]["text"] == "Satisfied with what Unreal provides right now."
+    # Utterance 0's genuine "Android" must survive -- scoping is the point.
+    assert data["utterances"][0]["text"] == "My Android phone is fine."
+    assert log[0].startswith("applied") and log[1].startswith("suggested only")
+    assert log[2].startswith("skipped (text not found")
+    print("[ok] pipeline: LLM fixes apply per-utterance, high-confidence only")
+
+
+def test_pipeline_llm_review_call_shape():
+    from types import SimpleNamespace
+    from video_transcribe.pipeline import llm_review
+
+    seen = {}
+
+    class FakeMessages:
+        def __init__(self, stop_reason):
+            self.stop_reason = stop_reason
+
+        def parse(self, **kw):
+            seen.update(kw)
+            Review = kw["output_format"]
+            parsed = Review(summary="s", notes=[], qc_verdicts=[], corrections=[
+                {"utterance_index": 0, "from_text": "Android", "to_text": "Unreal",
+                 "reason": "engine context", "confidence": "high"}])
+            return SimpleNamespace(stop_reason=self.stop_reason, parsed_output=parsed)
+
+    data = {"utterances": [{"start": 65.0, "end": 70.0, "speaker": "Sharad",
+                            "text": "what Android provides"}]}
+    out = llm_review(data, notes="* fog", findings=[], glossary=None,
+                     model="claude-opus-5-5",
+                     client=SimpleNamespace(messages=FakeMessages("end_turn")))
+    assert out.corrections[0].to_text == "Unreal"
+    assert seen["model"] == "claude-opus-5-5"
+    assert "[0] 01:05 Sharad: what Android provides" in seen["messages"][0]["content"]
+
+    try:
+        llm_review(data, notes="", findings=[], glossary=None, model="m",
+                   client=SimpleNamespace(messages=FakeMessages("refusal")))
+    except RuntimeError as e:
+        assert "refusal" in str(e)
+    else:
+        raise AssertionError("a refusal must not be read as an empty review")
+    print("[ok] pipeline: llm_review builds the prompt, parses schema, surfaces refusals")
+
+
+def test_pipeline_check_with_fake_llm():
+    import argparse
+    import json
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+    from video_transcribe import pipeline
+
+    data = {
+        "title": "t.mp4", "language": "en", "duration": 9.0, "model": "m", "diarized": True,
+        "speakers": ["Mar", "Sharad"],
+        "utterances": [{"start": 5.0, "end": 9.0, "speaker": "Sharad",
+                        "text": "Satisfied with what Android provides right now."}],
+        "segments": [{"id": 0, "start": 5.0, "end": 9.0, "speaker": "Sharad",
+                      "text": "Satisfied with what Android provides right now."}],
+    }
+
+    def fake_review(data, *, notes, findings, glossary, model):
+        assert "volumetric fog" in notes
+        return SimpleNamespace(
+            summary="ok",
+            notes=[SimpleNamespace(note="volumetric fog", status="confirmed",
+                                   utterance_index=0, evidence="what ... provides")],
+            corrections=[_fake_fix(0, "Android", "Unreal")],
+            qc_verdicts=[])
+
+    real = pipeline.llm_review
+    pipeline.llm_review = fake_review
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            cfg = Path(tmp) / "cfg.json"
+            cfg.write_text("{}", encoding="utf-8")
+            args = argparse.Namespace(transcript=path, notes=None,
+                                      notes_text="* volumetric fog", llm=True,
+                                      apply_llm_fixes=True, llm_model=None,
+                                      config=cfg, glossary=None)
+            rc = pipeline.run("check", args)
+            assert rc == pipeline.EXIT_CLEAN, rc
+            assert "Unreal provides" in (Path(tmp) / "t.txt").read_text(encoding="utf-8")
+            report = (Path(tmp) / "t.report.md").read_text(encoding="utf-8")
+            assert "confirmed" in report and "applied" in report
+    finally:
+        pipeline.llm_review = real
+    print("[ok] pipeline: check + LLM review writes report and applies fix end-to-end")
+
+
 if __name__ == "__main__":
     test_diarized()
     test_no_diarize()
@@ -640,5 +786,9 @@ if __name__ == "__main__":
     test_qc_impossible_rate_needs_repetition()
     test_qc_extreme_rate_and_duplicate_speaker()
     test_qc_clean_transcript_has_no_review_findings()
+    test_pipeline_transcribe_argv()
+    test_pipeline_apply_fixes_scoped()
+    test_pipeline_llm_review_call_shape()
+    test_pipeline_check_with_fake_llm()
     test_formats()
     print("\nALL SMOKE CHECKS PASSED")
